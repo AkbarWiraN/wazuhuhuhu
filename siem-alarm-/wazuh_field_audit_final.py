@@ -20,7 +20,9 @@ import argparse
 import base64
 import collections
 import datetime as dt
+import getpass
 import json
+import os
 import ssl
 import sys
 import urllib.error
@@ -93,7 +95,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Audit actual Wazuh alert fields")
     parser.add_argument("--url", default="https://127.0.0.1:9200")
     parser.add_argument("--user", default="admin")
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--password")
     parser.add_argument("--index", default="wazuh-alerts-*")
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--limit", type=int, default=3000)
@@ -101,7 +103,11 @@ def main() -> int:
     parser.add_argument("--output", default="/tmp/wazuh_field_audit_report.json")
     args = parser.parse_args()
 
-    client = Client(args.url, args.user, args.password, args.verify_ssl)
+    password = args.password or os.environ.get("WAZUH_PASS")
+    if not password:
+        password = getpass.getpass("Indexer password: ")
+
+    client = Client(args.url, args.user, password, args.verify_ssl)
     gte = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)).isoformat().replace("+00:00", "Z")
 
     body = {

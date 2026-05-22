@@ -1,6 +1,6 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.2 AIO
 
-> **Versi 3.2** — Progressive Alarm + Escalation Log Pattern
+> **Versi 3.3** — Progressive Alarm + Escalation Log Pattern
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
@@ -80,6 +80,8 @@ coarse|003|2010935|2026-05-22T10:00:00Z
 ```
 
 `alarm.id` = `sha256(case_key)` → stabil, deterministik, dipakai sebagai document ID di index.
+
+Gunakan hash SHA-256 penuh 64 karakter hex. Jangan memotong hash menjadi 32 karakter karena document ID OpenSearch bebas menerima string panjang dan hash penuh menurunkan risiko collision.
 
 ### 2.2 Kenapa `srcip` tidak masuk primary key?
 
@@ -395,11 +397,23 @@ Field Wazuh bersifat dynamic tergantung decoder. Audit wajib dilakukan sebelum p
 
 ### 9.2 Jalankan audit
 
+**Cara aman — environment variable:**
+```bash
+export WAZUH_PASS='PASSWORD_INDEXER'
+sudo -E python3 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
+  --url https://127.0.0.1:9200 \
+  --user admin \
+  --hours 24 \
+  --limit 3000 \
+  --output /tmp/wazuh_field_audit_report.json
+unset WAZUH_PASS
+```
+
+**Cara aman — input interaktif:**
 ```bash
 sudo python3 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
   --url https://127.0.0.1:9200 \
   --user admin \
-  --password 'PASSWORD_INDEXER' \
   --hours 24 \
   --limit 3000 \
   --output /tmp/wazuh_field_audit_report.json
@@ -472,6 +486,20 @@ Field berikut harus ada di template:
     }
   }
 },
+"rule": {
+  "properties": {
+    "level_strategy": { "type": "keyword" },
+    "max_level": { "type": "integer" },
+    "mode_level": { "type": "integer" },
+    "median_level": { "type": "integer" },
+    "level_counts": {
+      "properties": {
+        "level": { "type": "integer" },
+        "count": { "type": "integer" }
+      }
+    }
+  }
+},
 "soc": {
   "properties": {
     "notification": { "type": "boolean" },
@@ -479,6 +507,8 @@ Field berikut harus ada di template:
   }
 }
 ```
+
+> **Catatan sinkronisasi template**: `siem_alarm_template_final.json` dan fungsi `template()` di `siem_alarm_scoring_final.py` harus selalu di-update bersama. Script meng-install template dari fungsi `template()`, sedangkan file JSON dipakai untuk Dev Tools/manual review.
 
 ### 10.3 Via Dev Tools
 
@@ -503,14 +533,18 @@ Pastikan config memakai nama key yang memang dibaca oleh script:
   "bucket_minutes": 60,
   "lookback_minutes": 60,
   "process_current_bucket_only": true,
+  "lookback_overlap_minutes": 7,
   "escalation_log_enabled": true,
   "escalation_log_levels": ["Medium", "High", "Critical"],
+  "threat_level_strategy": "max",
+  "max_alerts_per_run": 50000,
   "password": "GANTI_PASSWORD_INDEXER_ANDA",
   "install_template": true
 }
 ```
 
 Interval eksekusi 5 menit diatur oleh systemd timer `OnUnitActiveSec=5min`, bukan oleh key `schedule_interval_minutes` di config.
+Mode `--loop` tersedia di script untuk testing, tetapi tidak direkomendasikan untuk production. Untuk production gunakan systemd timer.
 
 ### 11.2 Test syntax
 
@@ -989,7 +1023,7 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 **Persiapan:**
 - [ ] Audit field sudah dijalankan.
 - [ ] Asset value disiapkan via labels atau `assets.json`.
-- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`, `escalation_log_enabled: true`).
+- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`, `lookback_overlap_minutes: 7`, `escalation_log_enabled: true`, `max_alerts_per_run: 50000`).
 - [ ] Index template `siem-alarm-*` sudah dibuat (termasuk mapping field `risk.level_history`).
 
 **Validasi script:**
@@ -1125,4 +1159,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 3.2 — Perubahan dari v3.1: istilah notifikasi diperjelas sebagai dokumen `alarm_escalation` di `siem-alarm-*`, bukan integrasi Telegram/Slack/email langsung. Script membuat log eskalasi baru saat level pertama kali eligible atau naik, sementara dokumen `alarm_state` tetap di-update.*
+*Versi 3.3 — Perubahan dari v3.2: `alarm.id` memakai SHA-256 penuh 64 hex, query overlap bucket sebelumnya dibuat aman dengan `lookback_overlap_minutes`, scroll dibatasi `max_alerts_per_run`, audit mendukung password via env/interaktif, installer memvalidasi Python, dan config default `rule_overrides` dibuat kosong agar tidak membingungkan.*

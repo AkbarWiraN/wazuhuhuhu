@@ -118,6 +118,28 @@
             "level": {
               "type": "integer"
             },
+            "level_strategy": {
+              "type": "keyword"
+            },
+            "max_level": {
+              "type": "integer"
+            },
+            "mode_level": {
+              "type": "integer"
+            },
+            "median_level": {
+              "type": "integer"
+            },
+            "level_counts": {
+              "properties": {
+                "level": {
+                  "type": "integer"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              }
+            },
             "description": {
               "type": "text",
               "fields": {

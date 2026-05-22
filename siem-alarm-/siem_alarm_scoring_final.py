@@ -475,7 +475,7 @@ def build_case_key(alert: Dict[str, Any], observed: Dict[str, Optional[str]], bu
 
 
 def make_id(case_key: str) -> str:
-    return hashlib.sha256(case_key.encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256(case_key.encode("utf-8")).hexdigest()
 
 
 def build_query(config: Dict[str, Any], gte: str, lte: str) -> Dict[str, Any]:
@@ -505,6 +505,8 @@ def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte
         "_source": True,
     }
     keepalive = config.get("scroll_keepalive", "2m")
+    max_alerts = int(config.get("max_alerts_per_run", 50000))
+    emitted = 0
     response = client.search(config.get("source_index", "wazuh-alerts-*"), body, {"scroll": keepalive})
     scroll_id = response.get("_scroll_id")
 
@@ -514,6 +516,16 @@ def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte
             if not hits:
                 break
             for hit in hits:
+                if max_alerts > 0 and emitted >= max_alerts:
+                    message = (
+                        f"max_alerts_per_run reached ({max_alerts}); run aborted before writing partial aggregates "
+                        f"for gte={gte} lte={lte}"
+                    )
+                    logging.error(
+                        message
+                    )
+                    raise RuntimeError(message)
+                emitted += 1
                 yield hit.get("_index", ""), hit.get("_id", ""), hit.get("_source", {})
             if not scroll_id:
                 break
@@ -530,6 +542,34 @@ def count_values(counter: collections.Counter, limit: int) -> List[Dict[str, Any
 
 def sample_values(counter: collections.Counter, limit: int) -> List[str]:
     return [str(k) for k, _ in counter.most_common(limit)]
+
+
+def weighted_median(counter: collections.Counter) -> int:
+    if not counter:
+        return 0
+    total = sum(counter.values())
+    midpoint = (total + 1) // 2
+    running = 0
+    for value, count in sorted(counter.items()):
+        running += count
+        if running >= midpoint:
+            return int(value)
+    return int(counter.most_common(1)[0][0])
+
+
+def select_rule_level(counter: collections.Counter, strategy: str) -> int:
+    if not counter:
+        return 0
+    strategy = str(strategy or "max").lower()
+    if strategy == "mode":
+        return int(counter.most_common(1)[0][0])
+    if strategy == "median":
+        return weighted_median(counter)
+    return int(max(counter.keys()))
+
+
+def rule_level_counts(counter: collections.Counter) -> List[Dict[str, int]]:
+    return [{"level": int(level), "count": int(count)} for level, count in sorted(counter.items())]
 
 
 def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -557,6 +597,7 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
                 "sample_alert": alert,
                 "case_type": classify_case_type(alert),
                 "max_rule_level": to_int(first_value(alert, ["rule.level"], 0), 0),
+                "rule_levels": collections.Counter(),
                 "asset": get_asset(alert, assets),
                 "srcip": collections.Counter(),
                 "dstip": collections.Counter(),
@@ -575,7 +616,9 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
         bucket["event_count"] += 1
         bucket["first_seen"] = min(bucket["first_seen"], ts)
         bucket["last_seen"] = max(bucket["last_seen"], ts)
-        bucket["max_rule_level"] = max(bucket["max_rule_level"], to_int(first_value(alert, ["rule.level"], 0), 0))
+        current_rule_level = to_int(first_value(alert, ["rule.level"], 0), 0)
+        bucket["max_rule_level"] = max(bucket["max_rule_level"], current_rule_level)
+        bucket["rule_levels"][current_rule_level] += 1
 
         for field in ["srcip", "dstip", "dstport", "proto", "url", "user", "user_agent", "file_path", "file_hash", "cve", "sca_check"]:
             value = observed.get(field)
@@ -608,7 +651,12 @@ def normalize_level_history(value: Any) -> List[Dict[str, str]]:
 def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
     sample = bucket["sample_alert"]
     count = int(bucket["event_count"])
-    rule_level = int(bucket["max_rule_level"])
+    level_counter = bucket.get("rule_levels", collections.Counter())
+    rule_level_strategy = str(config.get("threat_level_strategy", "max")).lower()
+    rule_level = select_rule_level(level_counter, rule_level_strategy)
+    max_level = int(bucket["max_rule_level"])
+    mode_level = select_rule_level(level_counter, "mode")
+    median_level = select_rule_level(level_counter, "median")
     t_score = threat_score(rule_level)
     f_score = frequency_score(count)
     asset = bucket["asset"]
@@ -665,6 +713,11 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
         "rule": {
             "id": safe_str(first_value(sample, ["rule.id"], "unknown")),
             "level": rule_level,
+            "level_strategy": rule_level_strategy,
+            "max_level": max_level,
+            "mode_level": mode_level,
+            "median_level": median_level,
+            "level_counts": rule_level_counts(level_counter),
             "description": safe_str(first_value(sample, ["rule.description"], "Unknown rule")),
             "groups": groups,
         },
@@ -849,6 +902,16 @@ def template() -> Dict[str, Any]:
                         "properties": {
                             "id": {"type": "keyword"},
                             "level": {"type": "integer"},
+                            "level_strategy": {"type": "keyword"},
+                            "max_level": {"type": "integer"},
+                            "mode_level": {"type": "integer"},
+                            "median_level": {"type": "integer"},
+                            "level_counts": {
+                                "properties": {
+                                    "level": {"type": "integer"},
+                                    "count": {"type": "integer"},
+                                }
+                            },
                             "description": {
                                 "type": "text",
                                 "fields": {"keyword": {"type": "keyword", "ignore_above": 1024}},
@@ -977,9 +1040,15 @@ def run_once(config: Dict[str, Any]) -> int:
     assets = load_json(config.get("assets_file", "/opt/wazuh-risk-scoring/assets.json"), {})
     bucket_minutes = int(config.get("bucket_minutes", 60))
     lookback_minutes = int(config.get("lookback_minutes", bucket_minutes))
+    lookback_overlap_minutes = int(config.get("lookback_overlap_minutes", 7))
     now = utc_now()
+    current_bucket_start = bucket_start(now, bucket_minutes)
     if bool(config.get("process_current_bucket_only", True)):
-        gte = iso_z(bucket_start(now, bucket_minutes))
+        minutes_after_boundary = (now - current_bucket_start).total_seconds() / 60.0
+        if lookback_overlap_minutes > 0 and minutes_after_boundary <= lookback_overlap_minutes:
+            gte = iso_z(current_bucket_start - dt.timedelta(minutes=bucket_minutes))
+        else:
+            gte = iso_z(current_bucket_start)
     else:
         gte = iso_z(now - dt.timedelta(minutes=lookback_minutes))
     lte = iso_z(now)

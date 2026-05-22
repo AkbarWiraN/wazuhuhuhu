@@ -3,6 +3,18 @@ set -euo pipefail
 
 BASE_DIR="/opt/wazuh-risk-scoring"
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[!] python3 not found. Install python3 before running this setup."
+  exit 1
+fi
+
+PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+PYTHON_OK="$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')"
+if [[ "${PYTHON_OK}" != "1" ]]; then
+  echo "[!] python3 >= 3.9 is required. Found ${PYTHON_VERSION}."
+  exit 1
+fi
+
 echo "[+] Creating ${BASE_DIR}"
 sudo mkdir -p "${BASE_DIR}/logs"
 

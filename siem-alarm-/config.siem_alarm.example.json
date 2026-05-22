@@ -16,8 +16,11 @@
   "bucket_minutes": 60,
   "lookback_minutes": 60,
   "process_current_bucket_only": true,
+  "lookback_overlap_minutes": 7,
   "escalation_log_enabled": true,
   "escalation_log_levels": ["Medium", "High", "Critical"],
+  "threat_level_strategy": "max",
+  "max_alerts_per_run": 50000,
   "page_size": 1000,
   "scroll_keepalive": "2m",
   "min_rule_level": null,
@@ -25,12 +28,5 @@
   "excluded_rule_groups": [],
   "evidence_sample_limit": 20,
   "evidence_top_limit": 10,
-  "rule_overrides": {
-    "CONTOH_RULE_ID_TARGET_AWARE": {
-      "deduplication_mode": "target_aware"
-    },
-    "CONTOH_RULE_ID_FILE_AWARE": {
-      "deduplication_mode": "file_aware"
-    }
-  }
+  "rule_overrides": {}
 }
