@@ -1,0 +1,34 @@
+{
+  "001": {
+    "agent_name": "srv-database-01",
+    "asset_value": 5,
+    "asset_category": "Critical",
+    "asset_type": "Database Server",
+    "asset_owner": "Diskominfo",
+    "environment": "Production"
+  },
+  "002": {
+    "agent_name": "srv-web-01",
+    "asset_value": 4,
+    "asset_category": "High",
+    "asset_type": "Web Server",
+    "asset_owner": "Diskominfo",
+    "environment": "Production"
+  },
+  "003": {
+    "agent_name": "pfsense-suricata",
+    "asset_value": 4,
+    "asset_category": "High",
+    "asset_type": "Firewall/IDS Sensor",
+    "asset_owner": "Diskominfo",
+    "environment": "Production"
+  },
+  "004": {
+    "agent_name": "pc-admin-01",
+    "asset_value": 2,
+    "asset_category": "Low",
+    "asset_type": "Workstation",
+    "asset_owner": "Internal",
+    "environment": "Office"
+  }
+}

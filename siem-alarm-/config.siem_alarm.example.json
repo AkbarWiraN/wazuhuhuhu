@@ -1,0 +1,33 @@
+{
+  "opensearch_url": "https://127.0.0.1:9200",
+  "username": "admin",
+  "password": "GANTI_PASSWORD_INDEXER_ANDA",
+  "verify_ssl": false,
+  "ca_cert": "/etc/wazuh-indexer/certs/root-ca.pem",
+  "timeout": 60,
+  "source_index": "wazuh-alerts-*",
+  "destination_index_prefix": "siem-alarm",
+  "template_name": "siem-alarm-template",
+  "install_template": true,
+  "assets_file": "/opt/wazuh-risk-scoring/assets.json",
+  "log_file": "/opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log",
+  "log_level": "INFO",
+  "deduplication_mode": "coarse",
+  "bucket_minutes": 60,
+  "lookback_minutes": 60,
+  "page_size": 1000,
+  "scroll_keepalive": "2m",
+  "min_rule_level": null,
+  "excluded_rule_ids": [],
+  "excluded_rule_groups": [],
+  "evidence_sample_limit": 20,
+  "evidence_top_limit": 10,
+  "rule_overrides": {
+    "CONTOH_RULE_ID_TARGET_AWARE": {
+      "deduplication_mode": "target_aware"
+    },
+    "CONTOH_RULE_ID_FILE_AWARE": {
+      "deduplication_mode": "file_aware"
+    }
+  }
+}

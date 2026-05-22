@@ -1,0 +1,283 @@
+{
+  "index_patterns": [
+    "siem-alarm-*"
+  ],
+  "priority": 300,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "30s"
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "timestamp": {
+          "type": "date"
+        },
+        "alarm": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "case_key": {
+              "type": "keyword"
+            },
+            "deduplication_mode": {
+              "type": "keyword"
+            },
+            "case_type": {
+              "type": "keyword"
+            },
+            "status": {
+              "type": "keyword"
+            },
+            "dedup_key_fields": {
+              "type": "keyword"
+            },
+            "bucket_start": {
+              "type": "date"
+            },
+            "bucket_size": {
+              "type": "keyword"
+            },
+            "first_seen": {
+              "type": "date"
+            },
+            "last_seen": {
+              "type": "date"
+            },
+            "event_count": {
+              "type": "integer"
+            }
+          }
+        },
+        "agent": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "ip": {
+              "type": "keyword"
+            }
+          }
+        },
+        "rule": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "level": {
+              "type": "integer"
+            },
+            "description": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 1024
+                }
+              }
+            },
+            "groups": {
+              "type": "keyword"
+            }
+          }
+        },
+        "source_observed": {
+          "properties": {
+            "srcip_unique_count": {
+              "type": "integer"
+            },
+            "srcip_samples": {
+              "type": "keyword",
+              "ignore_above": 2048
+            },
+            "top_srcip": {
+              "properties": {
+                "value": {
+                  "type": "keyword",
+                  "ignore_above": 2048
+                },
+                "count": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "target_observed": {
+          "properties": {
+            "dstip_unique_count": {
+              "type": "integer"
+            },
+            "dstip_samples": {
+              "type": "keyword",
+              "ignore_above": 2048
+            },
+            "top_dstip": {
+              "properties": {
+                "value": {
+                  "type": "keyword",
+                  "ignore_above": 2048
+                },
+                "count": {
+                  "type": "integer"
+                }
+              }
+            },
+            "dstport_unique_count": {
+              "type": "integer"
+            },
+            "dstport_samples": {
+              "type": "keyword"
+            },
+            "proto_unique_count": {
+              "type": "integer"
+            },
+            "proto_samples": {
+              "type": "keyword"
+            }
+          }
+        },
+        "entity_observed": {
+          "properties": {
+            "url_unique_count": {
+              "type": "integer"
+            },
+            "url_samples": {
+              "type": "keyword",
+              "ignore_above": 2048
+            },
+            "top_url": {
+              "properties": {
+                "value": {
+                  "type": "keyword",
+                  "ignore_above": 2048
+                },
+                "count": {
+                  "type": "integer"
+                }
+              }
+            },
+            "user_unique_count": {
+              "type": "integer"
+            },
+            "user_samples": {
+              "type": "keyword",
+              "ignore_above": 2048
+            },
+            "user_agent_unique_count": {
+              "type": "integer"
+            },
+            "user_agent_samples": {
+              "type": "keyword",
+              "ignore_above": 2048
+            },
+            "file_path_unique_count": {
+              "type": "integer"
+            },
+            "file_path_samples": {
+              "type": "keyword",
+              "ignore_above": 2048
+            },
+            "file_hash_unique_count": {
+              "type": "integer"
+            },
+            "file_hash_samples": {
+              "type": "keyword"
+            },
+            "cve_unique_count": {
+              "type": "integer"
+            },
+            "cve_samples": {
+              "type": "keyword"
+            },
+            "sca_check_unique_count": {
+              "type": "integer"
+            },
+            "sca_check_samples": {
+              "type": "keyword"
+            }
+          }
+        },
+        "asset": {
+          "properties": {
+            "value": {
+              "type": "integer"
+            },
+            "category": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            },
+            "owner": {
+              "type": "keyword"
+            },
+            "environment": {
+              "type": "keyword"
+            },
+            "source": {
+              "type": "keyword"
+            }
+          }
+        },
+        "risk": {
+          "properties": {
+            "asset_value": {
+              "type": "integer"
+            },
+            "threat_score": {
+              "type": "integer"
+            },
+            "frequency_count_1h": {
+              "type": "integer"
+            },
+            "frequency_score": {
+              "type": "integer"
+            },
+            "score": {
+              "type": "float"
+            },
+            "level": {
+              "type": "keyword"
+            },
+            "formula": {
+              "type": "keyword"
+            }
+          }
+        },
+        "source": {
+          "properties": {
+            "index": {
+              "type": "keyword"
+            },
+            "raw_alert_count": {
+              "type": "integer"
+            },
+            "sample_document_id": {
+              "type": "keyword"
+            }
+          }
+        },
+        "soc": {
+          "properties": {
+            "recommended_action": {
+              "type": "keyword"
+            },
+            "sla": {
+              "type": "keyword"
+            },
+            "notification": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}
