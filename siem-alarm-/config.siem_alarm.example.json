@@ -15,6 +15,7 @@
   "deduplication_mode": "coarse",
   "bucket_minutes": 60,
   "lookback_minutes": 60,
+  "process_current_bucket_only": true,
   "page_size": 1000,
   "scroll_keepalive": "2m",
   "min_rule_level": null,

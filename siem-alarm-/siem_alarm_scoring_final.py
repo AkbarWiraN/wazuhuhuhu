@@ -179,6 +179,19 @@ class OpenSearchClient:
         quoted = urllib.parse.quote(doc_id, safe="")
         return self.request("PUT", f"{index}/_doc/{quoted}", doc)
 
+    def get_doc(self, index: str, doc_id: str) -> Optional[Dict[str, Any]]:
+        quoted = urllib.parse.quote(doc_id, safe="")
+        try:
+            response = self.request("GET", f"{index}/_doc/{quoted}")
+        except RuntimeError as exc:
+            if "OpenSearch HTTP 404" in str(exc):
+                return None
+            raise
+        if not response.get("found", False):
+            return None
+        source = response.get("_source")
+        return source if isinstance(source, dict) else None
+
     def search(self, index: str, body: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return self.request("POST", f"{index}/_search", body, params)
 
@@ -228,6 +241,17 @@ def risk_level(score: float) -> str:
     return "Critical"
 
 
+def risk_rank(level: Optional[str]) -> int:
+    order = {
+        "Information": 1,
+        "Low": 2,
+        "Medium": 3,
+        "High": 4,
+        "Critical": 5,
+    }
+    return order.get(str(level), 0)
+
+
 def recommended_action(level: str, asset: int, threat: int, freq: int) -> Tuple[str, str, bool]:
     if level == "Critical":
         return "Immediate investigation", "15 minutes", True
@@ -242,8 +266,19 @@ def recommended_action(level: str, asset: int, threat: int, freq: int) -> Tuple[
     return "Baseline", "No SLA", False
 
 
+def notification_enabled(level: str, level_changed: bool) -> bool:
+    return bool(level_changed and level in {"Medium", "High", "Critical"})
+
+
 def asset_category(value: int) -> str:
     return {5: "Critical", 4: "High", 3: "Medium", 2: "Low", 1: "Minimal"}.get(value, "Medium")
+
+
+def bucket_size_label(minutes: int) -> str:
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours}h"
+    return f"{minutes}m"
 
 
 def load_json(path: str, default: Any) -> Any:
@@ -539,7 +574,27 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
     return buckets
 
 
-def build_doc(bucket: Dict[str, Any], config: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+def destination_index_for_bucket(config: Dict[str, Any], bucket_iso: str) -> str:
+    parsed = parse_dt(bucket_iso) or utc_now()
+    prefix = config.get("destination_index_prefix", "siem-alarm")
+    return f"{prefix}-{parsed.strftime('%Y.%m.%d')}"
+
+
+def normalize_level_history(value: Any) -> List[Dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    history = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        level = item.get("level")
+        at = item.get("at")
+        if level and at:
+            history.append({"level": str(level), "at": str(at)})
+    return history
+
+
+def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
     sample = bucket["sample_alert"]
     count = int(bucket["event_count"])
     rule_level = int(bucket["max_rule_level"])
@@ -550,6 +605,22 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any]) -> Tuple[str, Dict
     r_score = round((a_score + t_score + f_score) / 3.0, 2)
     r_level = risk_level(r_score)
     action, sla, notify = recommended_action(r_level, a_score, t_score, f_score)
+    previous_level = None
+    level_history: List[Dict[str, str]] = []
+
+    if isinstance(existing_doc, dict):
+        existing_risk = existing_doc.get("risk", {})
+        if isinstance(existing_risk, dict):
+            previous = existing_risk.get("level")
+            previous_level = str(previous) if previous not in (None, "") else None
+            level_history = normalize_level_history(existing_risk.get("level_history"))
+
+    level_changed = previous_level is not None and risk_rank(r_level) > risk_rank(previous_level)
+    if not level_history:
+        level_history.append({"level": r_level if previous_level is None else previous_level, "at": iso_z(bucket["first_seen"])})
+    if level_changed and (not level_history or level_history[-1].get("level") != r_level):
+        level_history.append({"level": r_level, "at": iso_z(bucket["last_seen"])})
+    notify = notification_enabled(r_level, level_changed)
 
     doc_id = make_id(bucket["case_key"])
     groups = get_rule_groups(sample)
@@ -567,7 +638,7 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any]) -> Tuple[str, Dict
             "status": "open",
             "dedup_key_fields": bucket["dedup_key_fields"],
             "bucket_start": bucket["bucket_start"],
-            "bucket_size": f"{bucket['bucket_minutes']}m",
+            "bucket_size": bucket_size_label(int(bucket["bucket_minutes"])),
             "first_seen": iso_z(bucket["first_seen"]),
             "last_seen": iso_z(bucket["last_seen"]),
             "event_count": count,
@@ -629,6 +700,9 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any]) -> Tuple[str, Dict
             "frequency_score": f_score,
             "score": r_score,
             "level": r_level,
+            "previous_level": previous_level,
+            "level_changed": level_changed,
+            "level_history": level_history,
             "formula": "(A+B+C)/3",
         },
         "source": {
@@ -767,6 +841,15 @@ def template() -> Dict[str, Any]:
                             "frequency_score": {"type": "integer"},
                             "score": {"type": "float"},
                             "level": {"type": "keyword"},
+                            "previous_level": {"type": "keyword"},
+                            "level_changed": {"type": "boolean"},
+                            "level_history": {
+                                "type": "nested",
+                                "properties": {
+                                    "level": {"type": "keyword"},
+                                    "at": {"type": "date"},
+                                },
+                            },
                             "formula": {"type": "keyword"},
                         }
                     },
@@ -805,9 +888,13 @@ def run_once(config: Dict[str, Any]) -> int:
         client.put_template(config.get("template_name", "siem-alarm-template"), template())
 
     assets = load_json(config.get("assets_file", "/opt/wazuh-risk-scoring/assets.json"), {})
-    lookback_minutes = int(config.get("lookback_minutes", 60))
+    bucket_minutes = int(config.get("bucket_minutes", 60))
+    lookback_minutes = int(config.get("lookback_minutes", bucket_minutes))
     now = utc_now()
-    gte = iso_z(now - dt.timedelta(minutes=lookback_minutes))
+    if bool(config.get("process_current_bucket_only", True)):
+        gte = iso_z(bucket_start(now, bucket_minutes))
+    else:
+        gte = iso_z(now - dt.timedelta(minutes=lookback_minutes))
     lte = iso_z(now)
 
     logging.info("Querying raw alerts from %s gte=%s lte=%s", config.get("source_index", "wazuh-alerts-*"), gte, lte)
@@ -815,14 +902,18 @@ def run_once(config: Dict[str, Any]) -> int:
     buckets = aggregate(alerts, assets, config)
     logging.info("Aggregated buckets: %d", len(buckets))
 
-    destination_index = f"{config.get('destination_index_prefix', 'siem-alarm')}-{utc_now().strftime('%Y.%m.%d')}"
     written = 0
+    destination_indices = set()
     for bucket in buckets.values():
-        doc_id, doc = build_doc(bucket, config)
+        destination_index = destination_index_for_bucket(config, bucket["bucket_start"])
+        destination_indices.add(destination_index)
+        doc_id = make_id(bucket["case_key"])
+        existing_doc = client.get_doc(destination_index, doc_id)
+        doc_id, doc = build_doc(bucket, config, existing_doc)
         client.index_doc(destination_index, doc_id, doc)
         written += 1
 
-    logging.info("Written/updated documents: %d index=%s", written, destination_index)
+    logging.info("Written/updated documents: %d indices=%s", written, sorted(destination_indices))
     return written
 
 

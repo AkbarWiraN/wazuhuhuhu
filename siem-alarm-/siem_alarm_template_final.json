@@ -246,6 +246,23 @@
             "level": {
               "type": "keyword"
             },
+            "previous_level": {
+              "type": "keyword"
+            },
+            "level_changed": {
+              "type": "boolean"
+            },
+            "level_history": {
+              "type": "nested",
+              "properties": {
+                "level": {
+                  "type": "keyword"
+                },
+                "at": {
+                  "type": "date"
+                }
+              }
+            },
             "formula": {
               "type": "keyword"
             }
