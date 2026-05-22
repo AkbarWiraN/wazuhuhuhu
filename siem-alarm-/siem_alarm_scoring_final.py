@@ -266,8 +266,19 @@ def recommended_action(level: str, asset: int, threat: int, freq: int) -> Tuple[
     return "Baseline", "No SLA", False
 
 
-def notification_enabled(level: str, level_changed: bool) -> bool:
-    return bool(level_changed and level in {"Medium", "High", "Critical"})
+def escalation_log_levels(config: Dict[str, Any]) -> set[str]:
+    levels = config.get("escalation_log_levels", ["Medium", "High", "Critical"])
+    if not isinstance(levels, list):
+        return {"Medium", "High", "Critical"}
+    return {str(level) for level in levels}
+
+
+def escalation_log_required(current_level: str, previous_level: Optional[str], config: Dict[str, Any]) -> bool:
+    if not bool(config.get("escalation_log_enabled", True)):
+        return False
+    if current_level not in escalation_log_levels(config):
+        return False
+    return previous_level is None or risk_rank(current_level) > risk_rank(previous_level)
 
 
 def asset_category(value: int) -> str:
@@ -620,7 +631,7 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
         level_history.append({"level": r_level if previous_level is None else previous_level, "at": iso_z(bucket["first_seen"])})
     if level_changed and (not level_history or level_history[-1].get("level") != r_level):
         level_history.append({"level": r_level, "at": iso_z(bucket["last_seen"])})
-    notify = notification_enabled(r_level, level_changed)
+    write_escalation_log = escalation_log_required(r_level, previous_level, config)
 
     doc_id = make_id(bucket["case_key"])
     groups = get_rule_groups(sample)
@@ -630,6 +641,9 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
 
     doc = {
         "timestamp": bucket["bucket_start"],
+        "document": {
+            "type": "alarm_state",
+        },
         "alarm": {
             "id": doc_id,
             "case_key": bucket["case_key"],
@@ -702,6 +716,7 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
             "level": r_level,
             "previous_level": previous_level,
             "level_changed": level_changed,
+            "escalation_log_required": write_escalation_log,
             "level_history": level_history,
             "formula": "(A+B+C)/3",
         },
@@ -713,7 +728,8 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
         "soc": {
             "recommended_action": action,
             "sla": sla,
-            "notification": notify,
+            "notification": write_escalation_log,
+            "escalation_log": write_escalation_log,
         },
     }
 
@@ -721,6 +737,52 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
         del doc["agent"]["ip"]
 
     return doc_id, doc
+
+
+def build_escalation_doc(state_doc: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    risk = state_doc["risk"]
+    level = risk["level"]
+    previous_level = risk.get("previous_level")
+    alarm_id = state_doc["alarm"]["id"]
+    event_id = make_id(f"escalation|{alarm_id}|{level}")
+    now = iso_z(utc_now())
+
+    doc = {
+        "timestamp": state_doc["alarm"]["last_seen"],
+        "document": {
+            "type": "alarm_escalation",
+        },
+        "event": {
+            "kind": "alert",
+            "category": ["siem_alarm"],
+            "type": ["change"],
+            "action": "risk_level_escalated",
+            "created": now,
+        },
+        "escalation": {
+            "id": event_id,
+            "state_alarm_id": alarm_id,
+            "level": level,
+            "previous_level": previous_level,
+            "reason": "initial_eligible_level" if previous_level is None else "risk_level_increased",
+        },
+        "alarm": state_doc["alarm"],
+        "agent": state_doc["agent"],
+        "rule": state_doc["rule"],
+        "source_observed": state_doc["source_observed"],
+        "target_observed": state_doc["target_observed"],
+        "entity_observed": state_doc["entity_observed"],
+        "asset": state_doc["asset"],
+        "risk": risk,
+        "source": state_doc["source"],
+        "soc": {
+            "recommended_action": state_doc["soc"]["recommended_action"],
+            "sla": state_doc["soc"]["sla"],
+            "notification": True,
+            "escalation_log": True,
+        },
+    }
+    return event_id, doc
 
 
 def template() -> Dict[str, Any]:
@@ -738,6 +800,29 @@ def template() -> Dict[str, Any]:
                 "dynamic": True,
                 "properties": {
                     "timestamp": {"type": "date"},
+                    "document": {
+                        "properties": {
+                            "type": {"type": "keyword"},
+                        }
+                    },
+                    "event": {
+                        "properties": {
+                            "kind": {"type": "keyword"},
+                            "category": {"type": "keyword"},
+                            "type": {"type": "keyword"},
+                            "action": {"type": "keyword"},
+                            "created": {"type": "date"},
+                        }
+                    },
+                    "escalation": {
+                        "properties": {
+                            "id": {"type": "keyword"},
+                            "state_alarm_id": {"type": "keyword"},
+                            "level": {"type": "keyword"},
+                            "previous_level": {"type": "keyword"},
+                            "reason": {"type": "keyword"},
+                        }
+                    },
                     "alarm": {
                         "properties": {
                             "id": {"type": "keyword"},
@@ -843,6 +928,7 @@ def template() -> Dict[str, Any]:
                             "level": {"type": "keyword"},
                             "previous_level": {"type": "keyword"},
                             "level_changed": {"type": "boolean"},
+                            "escalation_log_required": {"type": "boolean"},
                             "level_history": {
                                 "type": "nested",
                                 "properties": {
@@ -865,6 +951,7 @@ def template() -> Dict[str, Any]:
                             "recommended_action": {"type": "keyword"},
                             "sla": {"type": "keyword"},
                             "notification": {"type": "boolean"},
+                            "escalation_log": {"type": "boolean"},
                         }
                     },
                 },
@@ -912,6 +999,10 @@ def run_once(config: Dict[str, Any]) -> int:
         doc_id, doc = build_doc(bucket, config, existing_doc)
         client.index_doc(destination_index, doc_id, doc)
         written += 1
+        if doc.get("risk", {}).get("escalation_log_required"):
+            escalation_id, escalation_doc = build_escalation_doc(doc)
+            client.index_doc(destination_index, escalation_id, escalation_doc)
+            written += 1
 
     logging.info("Written/updated documents: %d indices=%s", written, sorted(destination_indices))
     return written

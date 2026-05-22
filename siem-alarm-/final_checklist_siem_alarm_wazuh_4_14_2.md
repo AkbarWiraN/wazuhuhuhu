@@ -1,7 +1,7 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.2 AIO
 
-> **Versi 3.1** — Progressive Alarm + Escalating Notification Pattern
-> Timer: 5 menit | Bucket: 1 jam | Notifikasi: setiap kali risk.level naik
+> **Versi 3.2** — Progressive Alarm + Escalation Log Pattern
+> Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
 
@@ -18,7 +18,7 @@ agent.id + rule.id + timestamp_bucket_1h
 
 - Script jalan **setiap 5 menit**, bucket tetap **1 jam**.
 - `alarm.id` dibuat deterministik dari hash `case_key` → update, bukan duplikasi.
-- Notifikasi dikirim **hanya saat risk.level naik** (Escalating Notification Pattern).
+- Log eskalasi dibuat di `siem-alarm-*` saat risk.level pertama kali masuk Medium/High/Critical atau naik ke level lebih tinggi.
 - Field `srcip`, `dstip`, `dstport`, `proto`, `url`, `user`, `file_path`, `hash`, `CVE`, SCA = **evidence**, bukan pemecah case.
 
 ---
@@ -42,16 +42,16 @@ Contoh alur progressive alarm:
 ```text
 Menit 00 → 3 alert masuk   → raw_alert_count=3   → risk=Low      → alarm TERBENTUK
 Menit 05 → 12 alert masuk  → raw_alert_count=15  → risk=Low      → alarm UPDATE (silent)
-Menit 10 → 40 alert masuk  → raw_alert_count=55  → risk=Medium   → alarm UPDATE + NOTIFIKASI ①
-Menit 20 → 65 alert masuk  → raw_alert_count=120 → risk=High     → alarm UPDATE + NOTIFIKASI ②
-Menit 35 → 390 alert masuk → raw_alert_count=510 → risk=Critical → alarm UPDATE + NOTIFIKASI ③
+Menit 10 → 40 alert masuk  → raw_alert_count=55  → risk=Medium   → alarm UPDATE + LOG ESKALASI ①
+Menit 20 → 65 alert masuk  → raw_alert_count=120 → risk=High     → alarm UPDATE + LOG ESKALASI ②
+Menit 35 → 390 alert masuk → raw_alert_count=510 → risk=Critical → alarm UPDATE + LOG ESKALASI ③
 Menit 40 → 20 alert masuk  → raw_alert_count=530 → risk=Critical → alarm UPDATE (silent)
 ```
 
 Hasil akhir bucket 1 jam:
 
 ```text
-1 dokumen siem-alarm-* | raw_alert_count=530 | 3 notifikasi terkirim
+1 dokumen alarm_state di siem-alarm-* | raw_alert_count=530 | 3 dokumen alarm_escalation dibuat
 ```
 
 ---
@@ -435,10 +435,34 @@ sudo python3 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
 Field berikut harus ada di template:
 
 ```json
+"document": {
+  "properties": {
+    "type": { "type": "keyword" }
+  }
+},
+"event": {
+  "properties": {
+    "kind": { "type": "keyword" },
+    "category": { "type": "keyword" },
+    "type": { "type": "keyword" },
+    "action": { "type": "keyword" },
+    "created": { "type": "date" }
+  }
+},
+"escalation": {
+  "properties": {
+    "id": { "type": "keyword" },
+    "state_alarm_id": { "type": "keyword" },
+    "level": { "type": "keyword" },
+    "previous_level": { "type": "keyword" },
+    "reason": { "type": "keyword" }
+  }
+},
 "risk": {
   "properties": {
     "previous_level": { "type": "keyword" },
     "level_changed": { "type": "boolean" },
+    "escalation_log_required": { "type": "boolean" },
     "level_history": {
       "type": "nested",
       "properties": {
@@ -446,6 +470,12 @@ Field berikut harus ada di template:
         "at": { "type": "date" }
       }
     }
+  }
+},
+"soc": {
+  "properties": {
+    "notification": { "type": "boolean" },
+    "escalation_log": { "type": "boolean" }
   }
 }
 ```
@@ -473,6 +503,8 @@ Pastikan config memakai nama key yang memang dibaca oleh script:
   "bucket_minutes": 60,
   "lookback_minutes": 60,
   "process_current_bucket_only": true,
+  "escalation_log_enabled": true,
+  "escalation_log_levels": ["Medium", "High", "Critical"],
   "password": "GANTI_PASSWORD_INDEXER_ANDA",
   "install_template": true
 }
@@ -694,16 +726,18 @@ source.raw_alert_count = alarm.event_count = risk.frequency_count_1h
 
 ### 14.2 Validasi progressive update
 
-Cek field level_history untuk memastikan eskalasi tercatat:
+Cek dokumen `alarm_escalation` untuk memastikan log eskalasi tercatat:
 
 ```json
 GET siem-alarm-*/_search
 {
   "size": 5,
   "query": {
-    "term": { "risk.level_changed": true }
+    "term": { "document.type": "alarm_escalation" }
   },
   "_source": [
+    "document.type",
+    "escalation",
     "alarm.case_key",
     "risk.level",
     "risk.previous_level",
@@ -753,7 +787,7 @@ Hasil `_count` harus sama dengan `source.raw_alert_count` pada bucket tersebut d
 - [ ] Top `source.raw_alert_count` (alarm paling noisy).
 - [ ] Top `source_observed.srcip_unique_count`.
 - [ ] Trend alarm per jam berdasarkan `timestamp`.
-- [ ] **Panel eskalasi**: alarm dengan `risk.level_changed = true` dalam 1 jam terakhir.
+- [ ] **Panel eskalasi**: dokumen `document.type = alarm_escalation` dalam 1 jam terakhir.
 - [ ] Table investigasi utama.
 
 ### 15.2 Kolom table investigasi
@@ -785,101 +819,87 @@ soc.sla
 
 ---
 
-## 16. Notifikasi — Escalating Notification Pattern
+## 16. Log Eskalasi di `siem-alarm-*`
 
 ### 16.1 Prinsip
 
 ```text
-Notifikasi dikirim HANYA saat risk.level naik ke level yang lebih tinggi.
+Yang dimaksud "notifikasi" pada desain ini adalah **log event baru di `siem-alarm-*`**, bukan pengiriman Telegram/Slack/email langsung.
 
-Low    → tidak ada notifikasi otomatis
-Medium → notifikasi ① (eskalasi pertama)
-High   → notifikasi ② (eskalasi kedua)
-Critical → notifikasi ③ (eskalasi ketiga, paling urgent)
+Script tetap meng-update dokumen state alarm:
 
-Maksimal 3 notifikasi per alarm per bucket 1 jam.
+document.type = alarm_state
+
+Selain itu, script membuat dokumen event baru:
+
+document.type = alarm_escalation
+
+Dokumen `alarm_escalation` dibuat saat alarm pertama kali masuk level yang perlu ditindaklanjuti atau saat risk.level naik ke level yang lebih tinggi.
+
+Low      = hanya update alarm_state, tidak membuat alarm_escalation
+Medium   = buat log alarm_escalation
+High     = buat log alarm_escalation baru
+Critical = buat log alarm_escalation baru
+
+Aplikasi notifikasi eksternal, misalnya Telegram app terpisah, cukup membaca dokumen `alarm_escalation` dari `siem-alarm-*`.
 ```
 
 ### 16.2 Trigger condition
 
 ```text
-risk.level_changed = true
+document.type = "alarm_escalation"
 DAN
 risk.level IN ["Medium", "High", "Critical"]
 ```
 
 ### 16.3 Anti duplikasi
 
-Gunakan kombinasi unik berikut sebagai dedup key notifikasi:
+Gunakan document ID deterministik berikut untuk log eskalasi:
 
 ```text
-alarm.id + risk.level
+sha256("escalation|" + alarm.id + "|" + risk.level)
 ```
 
-Satu `alarm.id` + satu `risk.level` hanya boleh menghasilkan satu notifikasi. Notifikasi tidak dikirim ulang jika level tidak berubah.
+Satu `alarm.id` + satu `risk.level` hanya menghasilkan satu dokumen `alarm_escalation` per bucket. Jika 5 menit berikutnya level tetap sama, script hanya meng-update `alarm_state` dan tidak membuat log eskalasi baru.
 
-### 16.4 Implementasi dengan Elastalert2
+### 16.4 Contoh query untuk aplikasi eksternal
 
-```yaml
-name: siem-alarm-escalation
-type: any
-index: siem-alarm-*
-
-filter:
-  - term:
-      risk.level_changed: true
-  - terms:
-      risk.level: ["Medium", "High", "Critical"]
-
-# Dedup: alarm.id + risk.level
-query_key:
-  - alarm.id
-  - risk.level
-
-# Jangan kirim ulang untuk kombinasi alarm.id + level yang sama
-realert:
-  hours: 2
-
-alert:
-  - slack
-
-slack_webhook_url: "https://hooks.slack.com/services/XXXXX"
-
-alert_subject: "[{0}] ESKALASI ALARM — {1}"
-alert_subject_args:
-  - risk.level
-  - agent.name
-
-alert_text: |
-  *Risk Level*: {0} (sebelumnya: {1})
-  *Agent*: {2}
-  *Rule*: {3}
-  *Event Count*: {4}
-  *Score*: {5}
-  *Bucket*: {6} s/d {7}
-  *Case Key*: {8}
-
-alert_text_args:
-  - risk.level
-  - risk.previous_level
-  - agent.name
-  - rule.description
-  - source.raw_alert_count
-  - risk.score
-  - alarm.first_seen
-  - alarm.last_seen
-  - alarm.case_key
-
-alert_text_type: alert_text_only
+```json
+GET siem-alarm-*/_search
+{
+  "size": 50,
+  "sort": [{ "timestamp": { "order": "desc" } }],
+  "query": {
+    "bool": {
+      "must": [
+        { "term": { "document.type": "alarm_escalation" }},
+        { "terms": { "risk.level": ["Medium", "High", "Critical"] }}
+      ]
+    }
+  }
+}
 ```
 
-### 16.5 Perbandingan tool notifikasi
+### 16.5 Field penting untuk aplikasi eksternal
 
-| Tool | Kelebihan | Cocok untuk |
-|---|---|---|
-| **Elastalert2** | Query langsung `siem-alarm-*`, dedup per `alarm.id+level` | SOC tanpa dev resource |
-| **Custom Python webhook** | Kontrol penuh, bisa cek `level_history` | Tim dengan dev resource |
-| **Wazuh Active Response** | Built-in, tanpa tool tambahan | Notifikasi sederhana dari raw alert |
+```text
+document.type
+event.action
+escalation.id
+escalation.state_alarm_id
+escalation.level
+escalation.previous_level
+escalation.reason
+alarm.id
+alarm.case_key
+agent.name
+rule.description
+source.raw_alert_count
+risk.score
+risk.level
+risk.previous_level
+risk.level_history
+```
 
 ---
 
@@ -924,23 +944,21 @@ timestamp       → wajib ada
 
 Jangan hapus dari `wazuh-alerts-*`. Exclude hanya dari proses agregasi.
 
-### 18.3 Threshold notifikasi terlalu sensitif
+### 18.3 Threshold log eskalasi terlalu sensitif
 
-Ubah filter Elastalert2 dari:
+Ubah config script dari:
 
-```yaml
-- terms:
-    risk.level: ["Medium", "High", "Critical"]
+```json
+"escalation_log_levels": ["Medium", "High", "Critical"]
 ```
 
 Menjadi:
 
-```yaml
-- terms:
-    risk.level: ["High", "Critical"]
+```json
+"escalation_log_levels": ["High", "Critical"]
 ```
 
-Agar hanya notifikasi saat level High ke atas.
+Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 
 ---
 
@@ -950,13 +968,13 @@ Agar hanya notifikasi saat level High ke atas.
 - [ ] Menganggap `siem-alarm-*` sebagai pengganti evidence.
 - [ ] Menyalin semua raw alert ke `siem-alarm-*`.
 - [ ] Menggunakan INSERT bukan UPDATE untuk document ID yang sama (menyebabkan duplikasi alarm).
-- [ ] Tidak menyimpan `risk.previous_level` → notifikasi eskalasi tidak bisa dideteksi.
+- [ ] Tidak menyimpan `risk.previous_level` → log eskalasi tidak bisa dideteksi.
 - [ ] Memasukkan terlalu banyak field ke primary dedup key.
 - [ ] Memaksa semua alert punya `srcip` atau `dstip`.
 - [ ] Tidak membatasi agregasi dengan bucket waktu.
 - [ ] Tidak memvalidasi `raw_alert_count`.
-- [ ] Mengirim notifikasi langsung dari `wazuh-alerts-*`.
-- [ ] Mengirim notifikasi untuk setiap update (bukan hanya saat level naik).
+- [ ] Membuat log eskalasi langsung dari `wazuh-alerts-*`.
+- [ ] Membuat log eskalasi untuk setiap update 5 menit (bukan hanya saat eligible/naik level).
 - [ ] Memberi asset value 5 ke semua agent.
 - [ ] Mengetik password indexer langsung di command line.
 
@@ -971,7 +989,7 @@ Agar hanya notifikasi saat level High ke atas.
 **Persiapan:**
 - [ ] Audit field sudah dijalankan.
 - [ ] Asset value disiapkan via labels atau `assets.json`.
-- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`).
+- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`, `escalation_log_enabled: true`).
 - [ ] Index template `siem-alarm-*` sudah dibuat (termasuk mapping field `risk.level_history`).
 
 **Validasi script:**
@@ -988,12 +1006,12 @@ Agar hanya notifikasi saat level High ke atas.
 - [ ] `systemctl list-timers` menampilkan NEXT run dalam ~5 menit.
 - [ ] Timer jalan minimal sekali setelah di-enable.
 
-**Dashboard & notifikasi:**
+**Dashboard & log eskalasi:**
 - [ ] Index pattern `siem-alarm-*` dibuat, time field = `timestamp`.
 - [ ] Dashboard SOC dengan panel eskalasi tersedia.
-- [ ] Notifikasi dikonfigurasi dengan Elastalert2 atau tool lain.
-- [ ] Dedup notifikasi via `alarm.id + risk.level` sudah aktif.
-- [ ] Test eskalasi: pastikan notifikasi hanya dikirim saat level naik.
+- [ ] Query aplikasi eksternal membaca `document.type = alarm_escalation`.
+- [ ] Dedup log eskalasi via `escalation.id` sudah aktif.
+- [ ] Test eskalasi: pastikan log baru muncul saat level eligible/naik, bukan setiap update 5 menit.
 
 **Operasional:**
 - [ ] Log script dimonitor.
@@ -1012,7 +1030,7 @@ Agar hanya notifikasi saat level High ke atas.
 - level_changed selalu true padahal level tidak naik
 - Duplikasi dokumen ditemukan (alarm.id tidak unik per bucket)
 - Index siem-alarm-* membengkak tidak wajar
-- Notifikasi storm (dikirim berulang untuk case yang sama)
+- Log escalation storm (dokumen `alarm_escalation` dibuat berulang untuk case dan level yang sama)
 ```
 
 ### 21.2 Langkah rollback
@@ -1098,8 +1116,8 @@ Dedup key default  : agent.id + rule.id + timestamp_bucket_1h
 alarm.id           : sha256(case_key), dipakai sebagai document ID → update, bukan insert baru
 raw_alert_count    : bertambah setiap 5 menit selama bucket berjalan
 risk.score         : naik organik seiring raw_alert_count bertambah
-Notifikasi         : hanya saat risk.level naik (Escalating Notification Pattern)
-Maks notifikasi    : 3 per alarm per bucket (Low→Med, Med→High, High→Critical)
+Log eskalasi       : dokumen alarm_escalation di siem-alarm-* saat level eligible/naik
+Maks log eskalasi  : 3 per alarm per bucket (Medium, High, Critical)
 Evidence           : srcip/dstip/port/proto/url/user/file/hash — bukan pemecah case
 ```
 
@@ -1107,4 +1125,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 3.1 — Perubahan dari v3.0: mapping `risk` ditulis sebagai object `properties`, contoh config disinkronkan dengan key script (`bucket_minutes`, `lookback_minutes`, `process_current_bucket_only`), dan template/script pendukung diselaraskan untuk `risk.previous_level`, `risk.level_changed`, serta `risk.level_history`.*
+*Versi 3.2 — Perubahan dari v3.1: istilah notifikasi diperjelas sebagai dokumen `alarm_escalation` di `siem-alarm-*`, bukan integrasi Telegram/Slack/email langsung. Script membuat log eskalasi baru saat level pertama kali eligible atau naik, sementara dokumen `alarm_state` tetap di-update.*

@@ -16,6 +16,8 @@
   "bucket_minutes": 60,
   "lookback_minutes": 60,
   "process_current_bucket_only": true,
+  "escalation_log_enabled": true,
+  "escalation_log_levels": ["Medium", "High", "Critical"],
   "page_size": 1000,
   "scroll_keepalive": "2m",
   "min_rule_level": null,

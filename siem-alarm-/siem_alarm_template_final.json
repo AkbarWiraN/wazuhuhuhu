@@ -15,6 +15,51 @@
         "timestamp": {
           "type": "date"
         },
+        "document": {
+          "properties": {
+            "type": {
+              "type": "keyword"
+            }
+          }
+        },
+        "event": {
+          "properties": {
+            "kind": {
+              "type": "keyword"
+            },
+            "category": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            },
+            "action": {
+              "type": "keyword"
+            },
+            "created": {
+              "type": "date"
+            }
+          }
+        },
+        "escalation": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "state_alarm_id": {
+              "type": "keyword"
+            },
+            "level": {
+              "type": "keyword"
+            },
+            "previous_level": {
+              "type": "keyword"
+            },
+            "reason": {
+              "type": "keyword"
+            }
+          }
+        },
         "alarm": {
           "properties": {
             "id": {
@@ -252,6 +297,9 @@
             "level_changed": {
               "type": "boolean"
             },
+            "escalation_log_required": {
+              "type": "boolean"
+            },
             "level_history": {
               "type": "nested",
               "properties": {
@@ -290,6 +338,9 @@
               "type": "keyword"
             },
             "notification": {
+              "type": "boolean"
+            },
+            "escalation_log": {
               "type": "boolean"
             }
           }
