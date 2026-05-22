@@ -1,0 +1,486 @@
+{
+  "dummy_assumptions": {
+    "source_raw_alert": "Example PAM failed login alert from wazuh-alerts-4.x-2026.04.21",
+    "aggregation_mode": "coarse",
+    "bucket_start": "2026-04-21T02:00:00Z",
+    "bucket_size": "1h",
+    "case_key": "coarse|002|5503|2026-04-21T02:00:00Z",
+    "asset_note": "Agent 002 follows assets.example.json: asset value 4 / High. With rule level 5, this example reaches Medium at lower frequency and High when frequency_score becomes 5.",
+    "risk_formula": "(asset_value + threat_score + frequency_score) / 3",
+    "threat_score_from_rule_level_5": 2
+  },
+  "source_wazuh_alert_summary": {
+    "_index": "wazuh-alerts-4.x-2026.04.21",
+    "_id": "qx3qrZ0BdT3L6MHNrDob",
+    "timestamp": "2026-04-21T02:42:05.483+0000",
+    "agent": {
+      "id": "002",
+      "name": "DVWA-Alfian",
+      "ip": "192.168.100.99"
+    },
+    "rule": {
+      "id": "5503",
+      "level": 5,
+      "description": "PAM: User login failed.",
+      "groups": [
+        "pam",
+        "syslog",
+        "authentication_failed"
+      ]
+    },
+    "decoder": {
+      "name": "pam"
+    },
+    "data": {
+      "dstuser": "kalime",
+      "uid": "1000",
+      "euid": "1000",
+      "tty": ":0.0"
+    }
+  },
+  "siem_alarm_documents": [
+    {
+      "_index": "siem-alarm-2026.04.21",
+      "_id": "04edbcf067fe47b65ec7451c4e715dd391f369a916bb317ec3569b7509088495",
+      "_source": {
+        "timestamp": "2026-04-21T02:00:00Z",
+        "document": {
+          "type": "alarm_state"
+        },
+        "alarm": {
+          "id": "04edbcf067fe47b65ec7451c4e715dd391f369a916bb317ec3569b7509088495",
+          "case_key": "coarse|002|5503|2026-04-21T02:00:00Z",
+          "deduplication_mode": "coarse",
+          "case_type": "auth",
+          "status": "open",
+          "dedup_key_fields": [
+            "agent.id",
+            "rule.id",
+            "timestamp_bucket_1h"
+          ],
+          "bucket_start": "2026-04-21T02:00:00Z",
+          "bucket_size": "1h",
+          "first_seen": "2026-04-21T02:42:05Z",
+          "last_seen": "2026-04-21T02:58:33Z",
+          "event_count": 510
+        },
+        "agent": {
+          "id": "002",
+          "name": "DVWA-Alfian",
+          "ip": "192.168.100.99"
+        },
+        "rule": {
+          "id": "5503",
+          "level": 5,
+          "level_strategy": "max",
+          "max_level": 5,
+          "mode_level": 5,
+          "median_level": 5,
+          "level_counts": [
+            {
+              "level": 5,
+              "count": 510
+            }
+          ],
+          "description": "PAM: User login failed.",
+          "groups": [
+            "pam",
+            "syslog",
+            "authentication_failed"
+          ]
+        },
+        "source_observed": {
+          "srcip_unique_count": 0,
+          "srcip_samples": [],
+          "top_srcip": []
+        },
+        "target_observed": {
+          "dstip_unique_count": 1,
+          "dstip_samples": [
+            "192.168.100.99"
+          ],
+          "top_dstip": [
+            {
+              "value": "192.168.100.99",
+              "count": 510
+            }
+          ],
+          "dstport_unique_count": 0,
+          "dstport_samples": [],
+          "proto_unique_count": 0,
+          "proto_samples": []
+        },
+        "entity_observed": {
+          "url_unique_count": 0,
+          "url_samples": [],
+          "top_url": [],
+          "user_unique_count": 1,
+          "user_samples": [
+            "kalime"
+          ],
+          "user_agent_unique_count": 0,
+          "user_agent_samples": [],
+          "file_path_unique_count": 0,
+          "file_path_samples": [],
+          "file_hash_unique_count": 0,
+          "file_hash_samples": [],
+          "cve_unique_count": 0,
+          "cve_samples": [],
+          "sca_check_unique_count": 0,
+          "sca_check_samples": []
+        },
+        "asset": {
+          "value": 4,
+          "category": "High",
+          "type": "Web Server",
+          "owner": "Diskominfo",
+          "environment": "Production",
+          "source": "assets_json"
+        },
+        "risk": {
+          "asset_value": 4,
+          "threat_score": 2,
+          "frequency_count_1h": 510,
+          "frequency_score": 5,
+          "score": 3.67,
+          "level": "High",
+          "previous_level": "Medium",
+          "level_changed": true,
+          "escalation_log_required": true,
+          "level_history": [
+            {
+              "level": "Low",
+              "at": "2026-04-21T02:42:05Z"
+            },
+            {
+              "level": "Medium",
+              "at": "2026-04-21T02:50:10Z"
+            },
+            {
+              "level": "High",
+              "at": "2026-04-21T02:58:33Z"
+            }
+          ],
+          "formula": "(A+B+C)/3"
+        },
+        "source": {
+          "index": "wazuh-alerts-4.x-2026.04.21",
+          "raw_alert_count": 510,
+          "sample_document_id": "qx3qrZ0BdT3L6MHNrDob"
+        },
+        "soc": {
+          "recommended_action": "Investigate",
+          "sla": "1 hour",
+          "notification": true,
+          "escalation_log": true
+        }
+      }
+    },
+    {
+      "_index": "siem-alarm-2026.04.21",
+      "_id": "efb913d65548d4336b235aaee291076d3b4474a2653dca367138826c0fd5ef20",
+      "_source": {
+        "timestamp": "2026-04-21T02:50:10Z",
+        "document": {
+          "type": "alarm_escalation"
+        },
+        "event": {
+          "kind": "alert",
+          "category": [
+            "siem_alarm"
+          ],
+          "type": [
+            "change"
+          ],
+          "action": "risk_level_escalated",
+          "created": "2026-04-21T02:50:15Z"
+        },
+        "escalation": {
+          "id": "efb913d65548d4336b235aaee291076d3b4474a2653dca367138826c0fd5ef20",
+          "state_alarm_id": "04edbcf067fe47b65ec7451c4e715dd391f369a916bb317ec3569b7509088495",
+          "level": "Medium",
+          "previous_level": "Low",
+          "reason": "risk_level_increased"
+        },
+        "alarm": {
+          "id": "04edbcf067fe47b65ec7451c4e715dd391f369a916bb317ec3569b7509088495",
+          "case_key": "coarse|002|5503|2026-04-21T02:00:00Z",
+          "deduplication_mode": "coarse",
+          "case_type": "auth",
+          "status": "open",
+          "dedup_key_fields": [
+            "agent.id",
+            "rule.id",
+            "timestamp_bucket_1h"
+          ],
+          "bucket_start": "2026-04-21T02:00:00Z",
+          "bucket_size": "1h",
+          "first_seen": "2026-04-21T02:42:05Z",
+          "last_seen": "2026-04-21T02:50:10Z",
+          "event_count": 55
+        },
+        "agent": {
+          "id": "002",
+          "name": "DVWA-Alfian",
+          "ip": "192.168.100.99"
+        },
+        "rule": {
+          "id": "5503",
+          "level": 5,
+          "level_strategy": "max",
+          "max_level": 5,
+          "mode_level": 5,
+          "median_level": 5,
+          "level_counts": [
+            {
+              "level": 5,
+              "count": 55
+            }
+          ],
+          "description": "PAM: User login failed.",
+          "groups": [
+            "pam",
+            "syslog",
+            "authentication_failed"
+          ]
+        },
+        "source_observed": {
+          "srcip_unique_count": 0,
+          "srcip_samples": [],
+          "top_srcip": []
+        },
+        "target_observed": {
+          "dstip_unique_count": 1,
+          "dstip_samples": [
+            "192.168.100.99"
+          ],
+          "top_dstip": [
+            {
+              "value": "192.168.100.99",
+              "count": 55
+            }
+          ],
+          "dstport_unique_count": 0,
+          "dstport_samples": [],
+          "proto_unique_count": 0,
+          "proto_samples": []
+        },
+        "entity_observed": {
+          "url_unique_count": 0,
+          "url_samples": [],
+          "top_url": [],
+          "user_unique_count": 1,
+          "user_samples": [
+            "kalime"
+          ],
+          "user_agent_unique_count": 0,
+          "user_agent_samples": [],
+          "file_path_unique_count": 0,
+          "file_path_samples": [],
+          "file_hash_unique_count": 0,
+          "file_hash_samples": [],
+          "cve_unique_count": 0,
+          "cve_samples": [],
+          "sca_check_unique_count": 0,
+          "sca_check_samples": []
+        },
+        "asset": {
+          "value": 4,
+          "category": "High",
+          "type": "Web Server",
+          "owner": "Diskominfo",
+          "environment": "Production",
+          "source": "assets_json"
+        },
+        "risk": {
+          "asset_value": 4,
+          "threat_score": 2,
+          "frequency_count_1h": 55,
+          "frequency_score": 3,
+          "score": 3.0,
+          "level": "Medium",
+          "previous_level": "Low",
+          "level_changed": true,
+          "escalation_log_required": true,
+          "level_history": [
+            {
+              "level": "Low",
+              "at": "2026-04-21T02:42:05Z"
+            },
+            {
+              "level": "Medium",
+              "at": "2026-04-21T02:50:10Z"
+            }
+          ],
+          "formula": "(A+B+C)/3"
+        },
+        "source": {
+          "index": "wazuh-alerts-4.x-2026.04.21",
+          "raw_alert_count": 55,
+          "sample_document_id": "qx3qrZ0BdT3L6MHNrDob"
+        },
+        "soc": {
+          "recommended_action": "Triage",
+          "sla": "1 business day",
+          "notification": true,
+          "escalation_log": true
+        }
+      }
+    },
+    {
+      "_index": "siem-alarm-2026.04.21",
+      "_id": "66e7ac65574a5ed439e62cdca0be239c07e90274c5cecf96be993d34bcd0529d",
+      "_source": {
+        "timestamp": "2026-04-21T02:58:33Z",
+        "document": {
+          "type": "alarm_escalation"
+        },
+        "event": {
+          "kind": "alert",
+          "category": [
+            "siem_alarm"
+          ],
+          "type": [
+            "change"
+          ],
+          "action": "risk_level_escalated",
+          "created": "2026-04-21T02:58:38Z"
+        },
+        "escalation": {
+          "id": "66e7ac65574a5ed439e62cdca0be239c07e90274c5cecf96be993d34bcd0529d",
+          "state_alarm_id": "04edbcf067fe47b65ec7451c4e715dd391f369a916bb317ec3569b7509088495",
+          "level": "High",
+          "previous_level": "Medium",
+          "reason": "risk_level_increased"
+        },
+        "alarm": {
+          "id": "04edbcf067fe47b65ec7451c4e715dd391f369a916bb317ec3569b7509088495",
+          "case_key": "coarse|002|5503|2026-04-21T02:00:00Z",
+          "deduplication_mode": "coarse",
+          "case_type": "auth",
+          "status": "open",
+          "dedup_key_fields": [
+            "agent.id",
+            "rule.id",
+            "timestamp_bucket_1h"
+          ],
+          "bucket_start": "2026-04-21T02:00:00Z",
+          "bucket_size": "1h",
+          "first_seen": "2026-04-21T02:42:05Z",
+          "last_seen": "2026-04-21T02:58:33Z",
+          "event_count": 510
+        },
+        "agent": {
+          "id": "002",
+          "name": "DVWA-Alfian",
+          "ip": "192.168.100.99"
+        },
+        "rule": {
+          "id": "5503",
+          "level": 5,
+          "level_strategy": "max",
+          "max_level": 5,
+          "mode_level": 5,
+          "median_level": 5,
+          "level_counts": [
+            {
+              "level": 5,
+              "count": 510
+            }
+          ],
+          "description": "PAM: User login failed.",
+          "groups": [
+            "pam",
+            "syslog",
+            "authentication_failed"
+          ]
+        },
+        "source_observed": {
+          "srcip_unique_count": 0,
+          "srcip_samples": [],
+          "top_srcip": []
+        },
+        "target_observed": {
+          "dstip_unique_count": 1,
+          "dstip_samples": [
+            "192.168.100.99"
+          ],
+          "top_dstip": [
+            {
+              "value": "192.168.100.99",
+              "count": 510
+            }
+          ],
+          "dstport_unique_count": 0,
+          "dstport_samples": [],
+          "proto_unique_count": 0,
+          "proto_samples": []
+        },
+        "entity_observed": {
+          "url_unique_count": 0,
+          "url_samples": [],
+          "top_url": [],
+          "user_unique_count": 1,
+          "user_samples": [
+            "kalime"
+          ],
+          "user_agent_unique_count": 0,
+          "user_agent_samples": [],
+          "file_path_unique_count": 0,
+          "file_path_samples": [],
+          "file_hash_unique_count": 0,
+          "file_hash_samples": [],
+          "cve_unique_count": 0,
+          "cve_samples": [],
+          "sca_check_unique_count": 0,
+          "sca_check_samples": []
+        },
+        "asset": {
+          "value": 4,
+          "category": "High",
+          "type": "Web Server",
+          "owner": "Diskominfo",
+          "environment": "Production",
+          "source": "assets_json"
+        },
+        "risk": {
+          "asset_value": 4,
+          "threat_score": 2,
+          "frequency_count_1h": 510,
+          "frequency_score": 5,
+          "score": 3.67,
+          "level": "High",
+          "previous_level": "Medium",
+          "level_changed": true,
+          "escalation_log_required": true,
+          "level_history": [
+            {
+              "level": "Low",
+              "at": "2026-04-21T02:42:05Z"
+            },
+            {
+              "level": "Medium",
+              "at": "2026-04-21T02:50:10Z"
+            },
+            {
+              "level": "High",
+              "at": "2026-04-21T02:58:33Z"
+            }
+          ],
+          "formula": "(A+B+C)/3"
+        },
+        "source": {
+          "index": "wazuh-alerts-4.x-2026.04.21",
+          "raw_alert_count": 510,
+          "sample_document_id": "qx3qrZ0BdT3L6MHNrDob"
+        },
+        "soc": {
+          "recommended_action": "Investigate",
+          "sla": "1 hour",
+          "notification": true,
+          "escalation_log": true
+        }
+      }
+    }
+  ]
+}

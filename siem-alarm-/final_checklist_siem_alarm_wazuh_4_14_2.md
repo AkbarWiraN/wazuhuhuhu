@@ -1,6 +1,6 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.2 AIO
 
-> **Versi 3.3** — Progressive Alarm + Escalation Log Pattern
+> **Versi 3.5** — Progressive Alarm + Escalation Log Pattern
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
@@ -37,15 +37,15 @@ wazuh-alerts-* = raw alert / evidence asli (tidak diubah)
 siem-alarm-*   = aggregated SOC alarm, di-update tiap 5 menit, bucket 1 jam
 ```
 
-Contoh alur progressive alarm:
+Contoh alur progressive alarm untuk aset critical (`asset_value=5`) dan rule high threat (`threat_score=4`):
 
 ```text
-Menit 00 → 3 alert masuk   → raw_alert_count=3   → risk=Low      → alarm TERBENTUK
-Menit 05 → 12 alert masuk  → raw_alert_count=15  → risk=Low      → alarm UPDATE (silent)
-Menit 10 → 40 alert masuk  → raw_alert_count=55  → risk=Medium   → alarm UPDATE + LOG ESKALASI ①
-Menit 20 → 65 alert masuk  → raw_alert_count=120 → risk=High     → alarm UPDATE + LOG ESKALASI ②
-Menit 35 → 390 alert masuk → raw_alert_count=510 → risk=Critical → alarm UPDATE + LOG ESKALASI ③
-Menit 40 → 20 alert masuk  → raw_alert_count=530 → risk=Critical → alarm UPDATE (silent)
+Menit 00 → 3 alert masuk   → raw_alert_count=3   → score=3.33 → risk=Medium   → alarm TERBENTUK + LOG ESKALASI ①
+Menit 05 → 12 alert masuk  → raw_alert_count=15  → score=3.67 → risk=High     → alarm UPDATE + LOG ESKALASI ②
+Menit 10 → 40 alert masuk  → raw_alert_count=55  → score=4.00 → risk=High     → alarm UPDATE (silent)
+Menit 20 → 65 alert masuk  → raw_alert_count=120 → score=4.33 → risk=High     → alarm UPDATE (silent)
+Menit 35 → 390 alert masuk → raw_alert_count=510 → score=4.67 → risk=Critical → alarm UPDATE + LOG ESKALASI ③
+Menit 40 → 20 alert masuk  → raw_alert_count=530 → score=4.67 → risk=Critical → alarm UPDATE (silent)
 ```
 
 Hasil akhir bucket 1 jam:
@@ -127,6 +127,15 @@ source.raw_alert_count = alarm.event_count = risk.frequency_count_1h
 ```
 
 Nilai ini **bertambah setiap kali script jalan** selama bucket masih berjalan.
+
+Perbedaan penting:
+
+```text
+alarm_state.source.raw_alert_count      = kondisi terbaru/final bucket
+alarm_escalation.source.raw_alert_count = snapshot saat log eskalasi dibuat
+```
+
+Jadi jika `alarm_escalation` level Medium punya `raw_alert_count=55`, lalu `alarm_state` akhir bucket punya `raw_alert_count=510`, itu normal dan bukan inkonsistensi.
 
 ---
 
@@ -222,6 +231,9 @@ Contoh dokumen dengan progressive alarm state:
 ```json
 {
   "timestamp": "2026-05-22T10:00:00Z",
+  "document": {
+    "type": "alarm_state"
+  },
   "alarm": {
     "id": "a3f9c2b1d4e8...",
     "case_key": "coarse|003|2010935|2026-05-22T10:00:00Z",
@@ -260,26 +272,26 @@ Contoh dokumen dengan progressive alarm state:
     "proto_samples": ["TCP"]
   },
   "asset": {
-    "value": 4,
-    "category": "High",
+    "value": 5,
+    "category": "Critical",
     "type": "Firewall/IDS Sensor",
     "owner": "Diskominfo",
     "environment": "Production",
-    "source": "assets_json"
+    "source": "agent_label"
   },
   "risk": {
-    "asset_value": 4,
+    "asset_value": 5,
     "threat_score": 4,
     "frequency_count_1h": 510,
     "frequency_score": 5,
-    "score": 4.33,
+    "score": 4.67,
     "level": "Critical",
     "previous_level": "High",
     "level_changed": true,
+    "escalation_log_required": true,
     "level_history": [
-      {"level": "Low",      "at": "2026-05-22T10:03:20Z"},
-      {"level": "Medium",   "at": "2026-05-22T10:10:05Z"},
-      {"level": "High",     "at": "2026-05-22T10:20:10Z"},
+      {"level": "Medium",   "at": "2026-05-22T10:03:20Z"},
+      {"level": "High",     "at": "2026-05-22T10:05:10Z"},
       {"level": "Critical", "at": "2026-05-22T10:35:50Z"}
     ],
     "formula": "(A+B+C)/3"
@@ -292,12 +304,64 @@ Contoh dokumen dengan progressive alarm state:
   "soc": {
     "recommended_action": "Investigate",
     "sla": "1 hour",
-    "notification": true
+    "notification": true,
+    "escalation_log": true
   }
 }
 ```
 
-### 6.1 Penjelasan field risk baru
+Contoh dokumen log eskalasi yang dibuat saat level naik:
+
+```json
+{
+  "timestamp": "2026-05-22T10:35:50Z",
+  "document": {
+    "type": "alarm_escalation"
+  },
+  "event": {
+    "kind": "alert",
+    "category": ["siem_alarm"],
+    "type": ["change"],
+    "action": "risk_level_escalated",
+    "created": "2026-05-22T10:35:55Z"
+  },
+  "escalation": {
+    "id": "f6a8...",
+    "state_alarm_id": "a3f9c2b1d4e8...",
+    "level": "Critical",
+    "previous_level": "High",
+    "reason": "risk_level_increased"
+  },
+  "alarm": {
+    "id": "a3f9c2b1d4e8...",
+    "case_key": "coarse|003|2010935|2026-05-22T10:00:00Z",
+    "bucket_start": "2026-05-22T10:00:00Z",
+    "last_seen": "2026-05-22T10:35:50Z",
+    "event_count": 510
+  },
+  "risk": {
+    "score": 4.67,
+    "level": "Critical",
+    "previous_level": "High"
+  },
+  "source": {
+    "raw_alert_count": 510
+  },
+  "soc": {
+    "notification": true,
+    "escalation_log": true
+  }
+}
+```
+
+### 6.1 Tipe dokumen
+
+| `document.type` | Fungsi | Perilaku |
+|---|---|---|
+| `alarm_state` | State agregasi utama | Di-update dengan `alarm.id` yang sama |
+| `alarm_escalation` | Log event untuk aplikasi eksternal | Dokumen baru saat level pertama kali eligible atau naik |
+
+### 6.2 Penjelasan field risk baru
 
 | Field | Tipe | Keterangan |
 |---|---|---|
@@ -307,7 +371,7 @@ Contoh dokumen dengan progressive alarm state:
 
 > **Penting**: `level_changed` di-set `true` **hanya saat level naik**. Jika level turun (sangat jarang dalam bucket berjalan) atau sama, `level_changed = false`.
 
-### 6.2 Logika `alarm.id` sebagai document ID
+### 6.3 Logika `alarm.id` sebagai document ID
 
 ```text
 alarm.id = sha256(case_key)
@@ -583,7 +647,18 @@ Jalankan script dua kali dengan jeda, pastikan `raw_alert_count` bertambah dan d
 sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
   --config /opt/wazuh-risk-scoring/config.siem_alarm.json --once
 
-# Catat alarm.id dari output log
+# Ambil alarm_state terbaru dan catat alarm.id + raw_alert_count
+export WAZUH_PASS='PASSWORD_INDEXER'
+curl -k -u admin:"$WAZUH_PASS" -X GET \
+  "https://127.0.0.1:9200/siem-alarm-*/_search?pretty" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "size": 5,
+    "sort": [{ "alarm.last_seen": { "order": "desc" } }],
+    "query": { "term": { "document.type": "alarm_state" } },
+    "_source": ["alarm.id", "alarm.case_key", "alarm.last_seen", "source.raw_alert_count", "risk.level"]
+  }'
+unset WAZUH_PASS
 
 # Tunggu 5 menit atau tunggu alert baru masuk
 sleep 300
@@ -592,7 +667,7 @@ sleep 300
 sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
   --config /opt/wazuh-risk-scoring/config.siem_alarm.json --once
 
-# Cek: alarm.id sama, raw_alert_count bertambah
+# Cek ulang query di atas: alarm.id sama, raw_alert_count bertambah
 ```
 
 ---
@@ -715,7 +790,28 @@ sudo systemctl daemon-reload
 sudo systemctl restart siem-alarm-scoring.timer
 ```
 
-### 12.7 Checklist scheduling
+### 12.7 Manual backfill setelah outage
+
+`lookback_overlap_minutes=7` melindungi alert di akhir bucket jika service terlambat beberapa menit. Jika VM/service mati lebih lama dari overlap tersebut, jalankan backfill manual dengan window waktu eksplisit.
+
+Gunakan waktu UTC dan mulai dari awal bucket:
+
+```bash
+sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
+  --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
+  --once \
+  --from 2026-05-22T10:00:00Z \
+  --to 2026-05-22T12:00:00Z
+```
+
+Catatan:
+- Gunakan `--from` pada awal jam/bucket agar count bucket awal tidak parsial.
+- `--from` bersifat inclusive (`>=`) dan `--to` bersifat exclusive (`<`). Contoh di atas memproses `10:00:00Z <= timestamp < 12:00:00Z`.
+- Jangan gunakan `--loop` untuk backfill.
+- Jika jumlah alert sangat besar dan run berhenti karena `max_alerts_per_run`, naikkan limit sementara atau pecah backfill menjadi window lebih kecil.
+- Backfill historis dapat membuat dokumen `alarm_escalation` lama. Untuk mencegah aplikasi eksternal menganggapnya alert baru, pertimbangkan set sementara `"escalation_log_enabled": false` saat backfill historis, atau pastikan aplikasi eksternal memfilter window waktu yang benar.
+
+### 12.8 Checklist scheduling
 
 - [ ] `/etc/systemd/system/siem-alarm-scoring.service` dibuat.
 - [ ] `/etc/systemd/system/siem-alarm-scoring.timer` dibuat.
@@ -736,7 +832,7 @@ sudo systemctl restart siem-alarm-scoring.timer
 - [ ] Time field: `timestamp`
 - [ ] Buka Discover → pilih `siem-alarm-*` → set `Last 24 hours`.
 
-> `timestamp` di `siem-alarm-*` adalah awal bucket 1 jam, bukan waktu update terakhir. Gunakan `alarm.last_seen` untuk waktu event terbaru dalam bucket.
+> `alarm_state.timestamp` adalah awal bucket 1 jam. `alarm_escalation.timestamp` adalah waktu event eskalasi (`alarm.last_seen`). Untuk dashboard case utama gunakan filter `document.type = alarm_state`; untuk panel eskalasi gunakan `document.type = alarm_escalation`.
 
 ---
 
@@ -748,6 +844,9 @@ sudo systemctl restart siem-alarm-scoring.timer
 GET siem-alarm-*/_search
 {
   "size": 5,
+  "query": {
+    "term": { "document.type": "alarm_state" }
+  },
   "sort": [{ "source.raw_alert_count": { "order": "desc" } }]
 }
 ```
@@ -813,6 +912,12 @@ Hasil `_count` harus sama dengan `source.raw_alert_count` pada bucket tersebut d
 
 ### 15.1 Panel wajib
 
+Filter default untuk panel case utama:
+
+```json
+{ "term": { "document.type": "alarm_state" } }
+```
+
 - [ ] Total alarm Critical.
 - [ ] Total alarm High.
 - [ ] Distribusi `risk.level`.
@@ -824,9 +929,16 @@ Hasil `_count` harus sama dengan `source.raw_alert_count` pada bucket tersebut d
 - [ ] **Panel eskalasi**: dokumen `document.type = alarm_escalation` dalam 1 jam terakhir.
 - [ ] Table investigasi utama.
 
+Filter khusus panel eskalasi:
+
+```json
+{ "term": { "document.type": "alarm_escalation" } }
+```
+
 ### 15.2 Kolom table investigasi
 
 ```text
+document.type
 Time (dari timestamp)
 alarm.case_key
 alarm.event_count
@@ -876,6 +988,8 @@ High     = buat log alarm_escalation baru
 Critical = buat log alarm_escalation baru
 
 Aplikasi notifikasi eksternal, misalnya Telegram app terpisah, cukup membaca dokumen `alarm_escalation` dari `siem-alarm-*`.
+
+Nilai `source.raw_alert_count` pada `alarm_escalation` adalah snapshot pada saat eskalasi dibuat, bukan nilai final bucket.
 ```
 
 ### 16.2 Trigger condition
@@ -1050,6 +1164,7 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 **Operasional:**
 - [ ] Log script dimonitor.
 - [ ] Rollback plan disiapkan.
+- [ ] Prosedur manual backfill `--from/--to` dipahami untuk outage panjang.
 - [ ] SOP SOC diperbarui dengan penjelasan progressive alarm.
 
 ---
@@ -1159,4 +1274,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 3.3 — Perubahan dari v3.2: `alarm.id` memakai SHA-256 penuh 64 hex, query overlap bucket sebelumnya dibuat aman dengan `lookback_overlap_minutes`, scroll dibatasi `max_alerts_per_run`, audit mendukung password via env/interaktif, installer memvalidasi Python, dan config default `rule_overrides` dibuat kosong agar tidak membingungkan.*
+*Versi 3.5 — Perubahan dari v3.4: contoh scoring diperbaiki agar sesuai threshold risk level, `alarm_escalation.source.raw_alert_count` dijelaskan sebagai snapshot, manual backfill `--to` didefinisikan exclusive, dan risiko log eskalasi historis saat backfill didokumentasikan.*

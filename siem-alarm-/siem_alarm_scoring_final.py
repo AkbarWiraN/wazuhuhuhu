@@ -478,8 +478,9 @@ def make_id(case_key: str) -> str:
     return hashlib.sha256(case_key.encode("utf-8")).hexdigest()
 
 
-def build_query(config: Dict[str, Any], gte: str, lte: str) -> Dict[str, Any]:
-    must = [{"range": {"timestamp": {"gte": gte, "lte": lte}}}]
+def build_query(config: Dict[str, Any], gte: str, lte: str, upper_inclusive: bool = True) -> Dict[str, Any]:
+    upper_op = "lte" if upper_inclusive else "lt"
+    must = [{"range": {"timestamp": {"gte": gte, upper_op: lte}}}]
     must_not = []
 
     min_level = config.get("min_rule_level")
@@ -497,10 +498,10 @@ def build_query(config: Dict[str, Any], gte: str, lte: str) -> Dict[str, Any]:
     return {"bool": {"must": must, "must_not": must_not}}
 
 
-def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte: str) -> Iterable[Tuple[str, str, Dict[str, Any]]]:
+def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte: str, upper_inclusive: bool = True) -> Iterable[Tuple[str, str, Dict[str, Any]]]:
     body = {
         "size": int(config.get("page_size", 1000)),
-        "query": build_query(config, gte, lte),
+        "query": build_query(config, gte, lte, upper_inclusive),
         "sort": [{"timestamp": {"order": "asc"}}],
         "_source": True,
     }
@@ -519,7 +520,7 @@ def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte
                 if max_alerts > 0 and emitted >= max_alerts:
                     message = (
                         f"max_alerts_per_run reached ({max_alerts}); run aborted before writing partial aggregates "
-                        f"for gte={gte} lte={lte}"
+                        f"for gte={gte} {'lte' if upper_inclusive else 'lt'}={lte}"
                     )
                     logging.error(
                         message
@@ -1023,7 +1024,7 @@ def template() -> Dict[str, Any]:
     }
 
 
-def run_once(config: Dict[str, Any]) -> int:
+def run_once(config: Dict[str, Any], gte_override: Optional[str] = None, lte_override: Optional[str] = None) -> int:
     client = OpenSearchClient(
         config["opensearch_url"],
         config["username"],
@@ -1041,20 +1042,37 @@ def run_once(config: Dict[str, Any]) -> int:
     bucket_minutes = int(config.get("bucket_minutes", 60))
     lookback_minutes = int(config.get("lookback_minutes", bucket_minutes))
     lookback_overlap_minutes = int(config.get("lookback_overlap_minutes", 7))
-    now = utc_now()
-    current_bucket_start = bucket_start(now, bucket_minutes)
-    if bool(config.get("process_current_bucket_only", True)):
-        minutes_after_boundary = (now - current_bucket_start).total_seconds() / 60.0
-        if lookback_overlap_minutes > 0 and minutes_after_boundary <= lookback_overlap_minutes:
-            gte = iso_z(current_bucket_start - dt.timedelta(minutes=bucket_minutes))
-        else:
-            gte = iso_z(current_bucket_start)
+    if gte_override:
+        if not parse_dt(gte_override):
+            raise RuntimeError(f"Invalid --from datetime: {gte_override}")
+        if lte_override and not parse_dt(lte_override):
+            raise RuntimeError(f"Invalid --to datetime: {lte_override}")
+        gte = gte_override
+        lte = lte_override or iso_z(utc_now())
+        upper_inclusive = False
+        logging.info("Manual window override enabled: gte=%s lt=%s", gte, lte)
     else:
-        gte = iso_z(now - dt.timedelta(minutes=lookback_minutes))
-    lte = iso_z(now)
+        now = utc_now()
+        current_bucket_start = bucket_start(now, bucket_minutes)
+        if bool(config.get("process_current_bucket_only", True)):
+            minutes_after_boundary = (now - current_bucket_start).total_seconds() / 60.0
+            if lookback_overlap_minutes > 0 and minutes_after_boundary <= lookback_overlap_minutes:
+                gte = iso_z(current_bucket_start - dt.timedelta(minutes=bucket_minutes))
+            else:
+                gte = iso_z(current_bucket_start)
+        else:
+            gte = iso_z(now - dt.timedelta(minutes=lookback_minutes))
+        lte = iso_z(now)
+        upper_inclusive = True
 
-    logging.info("Querying raw alerts from %s gte=%s lte=%s", config.get("source_index", "wazuh-alerts-*"), gte, lte)
-    alerts = fetch_alerts(client, config, gte, lte)
+    logging.info(
+        "Querying raw alerts from %s gte=%s %s=%s",
+        config.get("source_index", "wazuh-alerts-*"),
+        gte,
+        "lte" if upper_inclusive else "lt",
+        lte,
+    )
+    alerts = fetch_alerts(client, config, gte, lte, upper_inclusive)
     buckets = aggregate(alerts, assets, config)
     logging.info("Aggregated buckets: %d", len(buckets))
 
@@ -1093,10 +1111,19 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval", type=int, default=300)
+    parser.add_argument("--from", dest="from_time", help="Manual backfill start time, e.g. 2026-05-22T10:00:00Z")
+    parser.add_argument("--to", dest="to_time", help="Manual backfill end time, defaults to now if omitted")
     args = parser.parse_args()
 
     config = load_config(args.config)
     setup_logging(config.get("log_file", "/opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log"), config.get("log_level", "INFO"))
+
+    if args.loop and (args.from_time or args.to_time):
+        logging.error("--from/--to cannot be used with --loop")
+        return 2
+    if args.to_time and not args.from_time:
+        logging.error("--to requires --from")
+        return 2
 
     if args.loop:
         while True:
@@ -1108,7 +1135,7 @@ def main() -> int:
         return 0
 
     try:
-        run_once(config)
+        run_once(config, args.from_time, args.to_time)
         return 0
     except Exception:
         logging.exception("Run failed")

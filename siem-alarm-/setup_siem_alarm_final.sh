@@ -90,7 +90,9 @@ echo "[!] Edit indexer password:"
 echo "    sudo nano ${BASE_DIR}/config.siem_alarm.json"
 echo
 echo "[+] Run field audit:"
-echo "    sudo python3 ${BASE_DIR}/wazuh_field_audit_final.py --url https://127.0.0.1:9200 --user admin --password 'PASSWORD_INDEXER' --hours 24 --limit 3000"
+echo "    export WAZUH_PASS='PASSWORD_INDEXER'"
+echo "    sudo -E python3 ${BASE_DIR}/wazuh_field_audit_final.py --url https://127.0.0.1:9200 --user admin --hours 24 --limit 3000 --output /tmp/wazuh_field_audit_report.json"
+echo "    unset WAZUH_PASS"
 echo
 echo "[+] Run scoring once:"
 echo "    sudo python3 ${BASE_DIR}/siem_alarm_scoring_final.py --config ${BASE_DIR}/config.siem_alarm.json --once"
