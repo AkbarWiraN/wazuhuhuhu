@@ -61,6 +61,22 @@ class ScoringTests(unittest.TestCase):
         generated = scoring.template({"destination_index_prefix": "custom-alarm"})
         self.assertEqual(generated["index_patterns"], ["custom-alarm-*"])
 
+    def test_ism_policy_only_targets_siem_alarm_after_90_days(self) -> None:
+        policy = json.loads(
+            (ROOT / "siem_alarm_ism_policy.json").read_text(encoding="utf-8")
+        )["policy"]
+        self.assertEqual(policy["ism_template"]["index_patterns"], ["siem-alarm-*"])
+        delete_transition = policy["states"][0]["transitions"][0]
+        self.assertEqual(delete_transition["state_name"], "delete")
+        self.assertEqual(delete_transition["conditions"]["min_index_age"], "90d")
+
+    def test_installer_is_pinned_to_wazuh_4_14_7(self) -> None:
+        installer = (ROOT / "setup_siem_alarm_final.sh").read_text(encoding="utf-8")
+        self.assertIn('EXPECTED_WAZUH_VERSION="4.14.7"', installer)
+        self.assertIn('EXPECTED_FILEBEAT_VERSION="7.10.2"', installer)
+        self.assertIn("filebeat test output", installer)
+        self.assertIn("final_checklist_siem_alarm_wazuh_4_14_7.md", installer)
+
     def test_progressive_risk_and_history(self) -> None:
         config = base_config()
         assets = {"003": {"asset_value": 5}}
@@ -183,6 +199,10 @@ class ScoringTests(unittest.TestCase):
         config["password_env"] = "UNIT_TEST_WAZUH_PASS"
         config["bucket_minutes"] = 70
         with tempfile.TemporaryDirectory() as temporary_directory:
+            ca_path = pathlib.Path(temporary_directory) / "root-ca.pem"
+            ca_path.write_text("test CA placeholder", encoding="utf-8")
+            config["verify_ssl"] = True
+            config["ca_cert"] = str(ca_path)
             path = pathlib.Path(temporary_directory) / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
             with mock.patch.dict(scoring.os.environ, {"UNIT_TEST_WAZUH_PASS": "secret"}):
@@ -193,8 +213,10 @@ class ScoringTests(unittest.TestCase):
         config = json.loads(
             (ROOT / "config.siem_alarm.example.json").read_text(encoding="utf-8")
         )
-        config["verify_ssl"] = False
         with tempfile.TemporaryDirectory() as temporary_directory:
+            ca_path = pathlib.Path(temporary_directory) / "root-ca.pem"
+            ca_path.write_text("test CA placeholder", encoding="utf-8")
+            config["ca_cert"] = str(ca_path)
             path = pathlib.Path(temporary_directory) / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
             with mock.patch.dict(scoring.os.environ, {"WAZUH_PASS": "secret"}):
@@ -202,6 +224,14 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(loaded["password"], "secret")
         self.assertFalse(loaded["install_template"])
         self.assertEqual(loaded["bucket_minutes"], 60)
+
+    def test_load_config_rejects_disabled_tls_verification(self) -> None:
+        config = base_config()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = pathlib.Path(temporary_directory) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "TLS verification is mandatory"):
+                scoring.load_config(str(path))
 
 
 if __name__ == "__main__":

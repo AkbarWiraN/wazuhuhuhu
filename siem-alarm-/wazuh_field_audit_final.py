@@ -125,10 +125,13 @@ def main() -> int:
     parser.add_argument("--index", default="wazuh-alerts-*")
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--limit", type=int, default=3000)
-    tls_group = parser.add_mutually_exclusive_group()
-    tls_group.add_argument("--verify-ssl", dest="verify_ssl", action="store_true")
-    tls_group.add_argument("--insecure", dest="verify_ssl", action="store_false")
-    parser.set_defaults(verify_ssl=True)
+    parser.add_argument(
+        "--verify-ssl",
+        dest="verify_ssl",
+        action="store_true",
+        default=True,
+        help="Verify Indexer TLS (mandatory; retained for explicit command readability)",
+    )
     parser.add_argument("--ca-cert", help="CA certificate used with --verify-ssl")
     parser.add_argument("--retry-attempts", type=int, default=4)
     parser.add_argument(

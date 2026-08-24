@@ -2,7 +2,7 @@
 """
 siem_alarm_scoring_final.py
 
-Final SOC alarm aggregation and risk scoring engine for Wazuh 4.14.x AIO.
+Final SOC alarm aggregation and risk scoring engine for Wazuh 4.14.7 AIO.
 
 Core design:
 - Read raw alerts from wazuh-alerts-*.
@@ -1375,10 +1375,13 @@ def load_config(path: str) -> Dict[str, Any]:
         if value and not os.path.isabs(value):
             raise RuntimeError(f"{key} must be an absolute path")
 
-    if config["verify_ssl"]:
-        ca_cert = config.get("ca_cert")
-        if ca_cert and not os.path.isfile(str(ca_cert)):
-            raise RuntimeError(f"CA certificate not found: {ca_cert}")
+    if not config["verify_ssl"]:
+        raise RuntimeError("verify_ssl=false is not allowed; Wazuh Indexer TLS verification is mandatory")
+    ca_cert = config.get("ca_cert")
+    if not ca_cert:
+        raise RuntimeError("ca_cert is required for the Wazuh Indexer root CA")
+    if not os.path.isfile(str(ca_cert)):
+        raise RuntimeError(f"CA certificate not found: {ca_cert}")
     return config
 
 

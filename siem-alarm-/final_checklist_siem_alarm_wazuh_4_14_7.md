@@ -1,13 +1,13 @@
-# FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.2 AIO
+# FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.7 AIO
 
-> **Versi 4.0** — Production-hardened Progressive Alarm + Immutable Escalation Log
+> **Versi 4.1** — Wazuh 4.14.7 compatibility + Production-hardened Progressive Alarm
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
 
 ## 0. Keputusan Desain Final
 
-- Wazuh 4.14.2 berjalan **single node / all-in-one** di Ubuntu VM.
+- Wazuh 4.14.7 berjalan **single node / all-in-one** di Ubuntu VM.
 - `wazuh-alerts-*` **tetap dipertahankan** sebagai raw evidence.
 - `siem-alarm-*` adalah index baru untuk **alarm agregasi SOC**, bukan copy mentah.
 - Default deduplication key:
@@ -23,6 +23,21 @@ agent.id + rule.id + timestamp_bucket_1h
 - TLS verification wajib untuk production menggunakan salinan Wazuh root CA.
 - Runtime memakai user Linux dan user Wazuh Indexer khusus `siem-alarm`, bukan `root`/`admin`.
 - Field `srcip`, `dstip`, `dstport`, `proto`, `url`, `user`, `file_path`, `hash`, `CVE`, SCA = **evidence**, bukan pemecah case.
+
+### 0.1 Baseline kompatibilitas 4.14.7
+
+- Semua komponen sentral harus berada pada patch yang sama: `wazuh-manager`, `wazuh-indexer`, dan `wazuh-dashboard` versi `4.14.7`.
+- Wazuh Indexer 4.14.7 dipasangkan dengan Filebeat OSS `7.10.2`.
+- Unit systemd resmi tetap `wazuh-manager`, `wazuh-indexer`, `wazuh-dashboard`, dan `filebeat`.
+- Index alert resmi tetap memakai pola `wazuh-alerts-*`; proyek hanya membacanya.
+- Perubahan 4.14.7 yang menghapus daemon lama `wazuh-dbd` tidak memengaruhi proyek karena tidak ada tahapan yang memakainya.
+
+Rujukan resmi yang menjadi baseline review:
+
+- [Wazuh 4.14.7 release notes](https://documentation.wazuh.com/current/release-notes/release-4-14-7.html)
+- [Wazuh central components compatibility](https://documentation.wazuh.com/current/upgrade-guide/index.html)
+- [Wazuh Indexer indices](https://documentation.wazuh.com/current/user-manual/wazuh-indexer/wazuh-indexer-indices.html)
+- [Wazuh RBAC/internal users](https://documentation.wazuh.com/current/user-manual/user-administration/rbac.html)
 
 ---
 
@@ -392,6 +407,16 @@ Tidak ada duplikasi dokumen untuk case_key yang sama dalam satu bucket.
 
 ### 7.1 Preflight
 
+Konfirmasi versi paket dan kesehatan output Filebeat sebelum menjalankan installer:
+
+```bash
+dpkg-query -W -f='${Package} ${Version}\n' \
+  wazuh-manager wazuh-indexer wazuh-dashboard filebeat
+sudo filebeat test output
+```
+
+Output wajib menunjukkan tiga komponen Wazuh `4.14.7` dan Filebeat `7.10.2`. Jangan lanjut jika patch komponen sentral berbeda atau `filebeat test output` gagal.
+
 ```bash
 cd /path/ke/folder/siem-alarm-
 sudo bash ./setup_siem_alarm_final.sh
@@ -399,6 +424,7 @@ sudo bash ./setup_siem_alarm_final.sh
 
 Installer wajib dijalankan dari paket lengkap, tetapi tidak bergantung pada current directory setelah path script ditemukan. Installer akan:
 
+- Memastikan paket Wazuh tepat `4.14.7`, Filebeat tepat `7.10.2`, seluruh service AIO aktif, certificate chain valid, dan `filebeat test output` berhasil.
 - Memvalidasi seluruh Python/JSON dan menjalankan automated unit tests sebelum mengubah `/opt` atau systemd.
 - Membuat user/group Linux `siem-alarm`.
 - Menyalin Wazuh CA dari `/etc/wazuh-indexer/certs/root-ca.pem`.
@@ -407,10 +433,13 @@ Installer wajib dijalankan dari paket lengkap, tetapi tidak bergantung pada curr
 - Memasang service, timer, dan logrotate tetapi **tidak meng-enable timer**.
 - Menjalankan `systemd-analyze verify`.
 
-Jika CA berada di lokasi lain:
+Jika CA atau sertifikat node Indexer berada di lokasi lain:
 
 ```bash
-sudo WAZUH_CA_SOURCE=/path/root-ca.pem bash ./setup_siem_alarm_final.sh
+sudo \
+  WAZUH_CA_SOURCE=/path/root-ca.pem \
+  WAZUH_INDEXER_CERT_SOURCE=/path/indexer.pem \
+  bash ./setup_siem_alarm_final.sh
 ```
 
 ### 7.2 File hasil instalasi
@@ -438,25 +467,31 @@ sudo WAZUH_CA_SOURCE=/path/root-ca.pem bash ./setup_siem_alarm_final.sh
 ### 8.1 Cek service
 
 ```bash
-sudo systemctl status wazuh-manager
-sudo systemctl status wazuh-indexer
-sudo systemctl status wazuh-dashboard
-sudo systemctl status filebeat
+sudo systemctl status wazuh-manager --no-pager
+sudo systemctl status wazuh-indexer --no-pager
+sudo systemctl status wazuh-dashboard --no-pager
+sudo systemctl status filebeat --no-pager
 ```
 
 ### 8.2 Cek koneksi indexer
 
-Sebelum test, buat internal user `siem_alarm_service` dan custom role melalui **Indexer Management → Security** dengan prinsip least privilege:
+Sebelum test, buka **Indexer Management → Security** sebagai administrator:
 
-- Read/search pada `wazuh-alerts-*`.
-- Create index dan create/update document pada `siem-alarm-*`.
-- Tidak diberi akses ke Security API, system index, atau index Wazuh lain.
-- Template dan ISM policy dipasang satu kali memakai administrator; runtime account tidak memerlukan cluster-admin.
+1. Pada **Internal users**, buat user `siem_alarm_service` dengan password unik.
+2. Pada **Roles**, buat role `siem_alarm_runtime` dengan:
+   - Cluster permissions: `cluster_composite_ops_ro`—dibutuhkan untuk operasi scroll/clear-scroll.
+   - Index pattern `wazuh-alerts-*`: allowed action `read`.
+   - Index pattern `siem-alarm-*`: allowed actions `read`, `index`, dan `create_index`.
+   - Tenant permissions: kosong.
+3. Pada tab **Mapped users** role tersebut, map `siem_alarm_service`.
+
+Hak `read` pada `siem-alarm-*` diperlukan karena engine membaca state lama sebelum progressive update. Jangan memberikan `indices_all`, akses Security API, system index, atau index Wazuh lain. Template dan ISM policy dipasang satu kali menggunakan administrator; runtime account tidak memerlukan cluster-admin.
 
 Gunakan input password interaktif dan verifikasi CA. Jangan memasukkan password ke argumen command.
 
 ```bash
-curl --fail --silent --show-error \
+sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user siem_alarm_service \
   https://127.0.0.1:9200
@@ -467,7 +502,8 @@ curl --fail --silent --show-error \
 ### 8.3 Cek raw alert
 
 ```bash
-curl --fail --silent --show-error \
+sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user siem_alarm_service \
   "https://127.0.0.1:9200/wazuh-alerts-*/_search?size=1&pretty"
@@ -497,15 +533,12 @@ sudo -u siem-alarm /usr/bin/python3 -B \
   --output /opt/wazuh-risk-scoring/logs/wazuh_field_audit_report.json
 ```
 
-Jika hanya untuk diagnosis sertifikat, opsi `--insecure` tersedia. Jangan gunakan sebagai konfigurasi production permanen.
+Jangan memakai `--insecure` atau `curl -k`. Jika verifikasi hostname gagal, lihat SAN sertifikat lalu gunakan hostname/IP yang memang tercantum:
 
 ```bash
-sudo -u siem-alarm /usr/bin/python3 -B \
-  /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
-  --url https://127.0.0.1:9200 \
-  --user siem_alarm_service \
-  --insecure --hours 1 --limit 100 \
-  --output /opt/wazuh-risk-scoring/logs/wazuh_field_audit_report.json
+sudo openssl x509 \
+  -in /etc/wazuh-indexer/certs/indexer.pem \
+  -noout -subject -issuer -dates -ext subjectAltName
 ```
 
 Laporan dibuat dengan mode `0600` dan penulisan melalui symbolic link ditolak pada Linux.
@@ -541,6 +574,7 @@ Install template satu kali menggunakan administrator Indexer; `--user admin` aka
 
 ```bash
 sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user admin \
   -H 'Content-Type: application/json' \
@@ -552,12 +586,31 @@ Install retention policy 90 hari satu kali. Sesuaikan `min_index_age` di file se
 
 ```bash
 sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user admin \
   -H 'Content-Type: application/json' \
   -X PUT 'https://127.0.0.1:9200/_plugins/_ism/policies/siem-alarm-retention-90d' \
   --data-binary @/opt/wazuh-risk-scoring/siem_alarm_ism_policy.json
 ```
+
+Verifikasi kedua objek setelah instalasi:
+
+```bash
+sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user admin \
+  'https://127.0.0.1:9200/_index_template/siem-alarm-template?pretty'
+
+sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user admin \
+  'https://127.0.0.1:9200/_plugins/_ism/policies/siem-alarm-retention-90d?pretty'
+```
+
+`ism_template` otomatis menerapkan policy hanya ke index baru yang cocok. Jangan menempelkan policy delete ke index lama secara massal sebelum umur index, backup, dan persetujuan retensi diperiksa. Jika policy dengan ID yang sama sudah ada, review hasil GET dan ikuti mekanisme update `if_seq_no`/`if_primary_term`; jangan menghapus policy aktif hanya agar PUT berhasil.
 
 > Jika `destination_index_prefix` bukan `siem-alarm`, ubah `index_patterns` pada kedua file JSON sebelum instalasi. Fungsi template internal Python otomatis mengikuti prefix config, tetapi file manual harus tetap disinkronkan.
 
@@ -704,10 +757,13 @@ sudo journalctl -u siem-alarm-scoring.service -n 100 --no-pager
 ### 11.5 Cek index
 
 ```bash
-curl --fail --silent --show-error \
+sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
-  --user siem_alarm_service \
-  "https://127.0.0.1:9200/_cat/indices/siem-alarm-*?v"
+  --user siem_alarm_service -X GET \
+  'https://127.0.0.1:9200/siem-alarm-*/_count?pretty' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"document.type":"alarm_state"}}}'
 ```
 
 ### 11.6 Validasi progressive update
@@ -719,7 +775,8 @@ Jalankan script dua kali dengan jeda, pastikan `raw_alert_count` bertambah dan d
 sudo systemctl start siem-alarm-scoring.service
 
 # Ambil alarm_state terbaru dan catat alarm.id + raw_alert_count
-curl --fail --silent --show-error \
+sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user siem_alarm_service -X GET \
   "https://127.0.0.1:9200/siem-alarm-*/_search?pretty" \
@@ -787,7 +844,7 @@ File ini juga dibuat otomatis oleh installer:
 
 ```ini
 [Unit]
-Description=SIEM Alarm Scoring Timer - update alarm setiap 5 menit, bucket 1 jam
+Description=SIEM Alarm Scoring Timer - every 5 minutes
 
 [Timer]
 OnCalendar=*-*-* *:0/5:00
@@ -819,13 +876,13 @@ sudo systemctl enable --now siem-alarm-scoring.timer
 
 ```bash
 # Status timer
-sudo systemctl status siem-alarm-scoring.timer
+sudo systemctl status siem-alarm-scoring.timer --no-pager
 
 # Lihat semua timer aktif + next run
 sudo systemctl list-timers --all | grep siem-alarm
 
 # Cek hasil run terakhir
-sudo systemctl status siem-alarm-scoring.service
+sudo systemctl status siem-alarm-scoring.service --no-pager
 ```
 
 Output yang diharapkan dari `list-timers`:
@@ -878,14 +935,20 @@ Gunakan waktu UTC dan mulai dari awal bucket:
 sudo systemctl stop siem-alarm-scoring.timer
 read -rsp 'Indexer password: ' WAZUH_PASS; echo
 export WAZUH_PASS
-sudo --preserve-env=WAZUH_PASS -u siem-alarm /usr/bin/python3 -B \
-  /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
-  --once \
-  --from 2026-05-22T10:00:00Z \
-  --to 2026-05-22T12:00:00Z
-unset WAZUH_PASS
-sudo systemctl start siem-alarm-scoring.timer
+if sudo --preserve-env=WAZUH_PASS -u siem-alarm /usr/bin/python3 -B \
+    /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
+    --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
+    --once \
+    --from 2026-05-22T10:00:00Z \
+    --to 2026-05-22T12:00:00Z; then
+  unset WAZUH_PASS
+  sudo systemctl start siem-alarm-scoring.timer
+else
+  BACKFILL_STATUS=$?
+  unset WAZUH_PASS
+  echo "Backfill gagal (exit ${BACKFILL_STATUS}); timer sengaja tetap berhenti." >&2
+  false
+fi
 ```
 
 Catatan:
@@ -1299,20 +1362,34 @@ sudo systemctl list-timers --all | grep siem-alarm
 **Step 3 — Hapus index bermasalah:**
 ```bash
 sudo curl --fail --silent --show-error \
+  --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user admin \
   'https://127.0.0.1:9200/_cat/indices/siem-alarm-*?v'
 
-# Hapus index tertentu
-sudo curl --fail --silent --show-error \
-  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
-  --user admin -X DELETE \
-  "https://127.0.0.1:9200/siem-alarm-2026.05.22"
+# Hapus satu index hanya setelah nama persis dikonfirmasi
+DELETE_INDEX='siem-alarm-2026.05.22'
+if [[ ! "${DELETE_INDEX}" =~ ^siem-alarm-[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]]; then
+  echo 'Nama index ditolak oleh safety guard.' >&2
+  false
+else
+  read -r -p "Ketik ${DELETE_INDEX} untuk menghapusnya: " CONFIRM_DELETE_INDEX
+  if [[ "${CONFIRM_DELETE_INDEX}" == "${DELETE_INDEX}" ]]; then
+    sudo curl --fail --silent --show-error \
+      --connect-timeout 10 --max-time 60 \
+      --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+      --user admin -X DELETE \
+      "https://127.0.0.1:9200/${DELETE_INDEX}"
+  else
+    echo 'Pembatalan: nama index tidak cocok.'
+  fi
+fi
 
 # ATAU hapus semua hanya setelah konfirmasi eksplisit
 read -r -p 'Ketik HAPUS-SEMUA-SIEM-ALARM: ' CONFIRM_DELETE
 if [[ "${CONFIRM_DELETE}" == "HAPUS-SEMUA-SIEM-ALARM" ]]; then
   sudo curl --fail --silent --show-error \
+    --connect-timeout 10 --max-time 60 \
     --cacert /opt/wazuh-risk-scoring/root-ca.pem \
     --user admin -X DELETE \
     "https://127.0.0.1:9200/siem-alarm-*"
@@ -1381,4 +1458,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 4.0 — Hardening production: escalation create-only sebelum state, retry/backoff, validasi failed shard, process lock, strict config/alert validation, TLS/CA, least-privilege service, calendar timer yang benar-benar persistent, journald + logrotate, backup installer, systemd verification, dan ISM retention policy.*
+*Versi 4.1 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, version gate installer, certificate-chain preflight, TLS verification mandatory, least-privilege `read/index/create_index`, escalation create-only sebelum state, retry/backoff, failed-shard validation, process lock, calendar timer persistent, journald + logrotate, backup installer, systemd verification, dan ISM retention policy.*

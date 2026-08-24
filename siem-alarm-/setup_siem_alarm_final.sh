@@ -6,7 +6,10 @@ BASE_DIR="/opt/wazuh-risk-scoring"
 CONFIG_DIR="/etc/wazuh-risk-scoring"
 SERVICE_USER="siem-alarm"
 SERVICE_GROUP="siem-alarm"
+EXPECTED_WAZUH_VERSION="4.14.7"
+EXPECTED_FILEBEAT_VERSION="7.10.2"
 CA_SOURCE="${WAZUH_CA_SOURCE:-/etc/wazuh-indexer/certs/root-ca.pem}"
+INDEXER_CERT_SOURCE="${WAZUH_INDEXER_CERT_SOURCE:-/etc/wazuh-indexer/certs/indexer.pem}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 BACKUP_DIR="${BASE_DIR}/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
@@ -17,7 +20,7 @@ required_files=(
   "siem_alarm_ism_policy.json"
   "config.siem_alarm.example.json"
   "assets.example.json"
-  "final_checklist_siem_alarm_wazuh_4_14_2.md"
+  "final_checklist_siem_alarm_wazuh_4_14_7.md"
   "tests/test_siem_alarm_scoring.py"
 )
 
@@ -42,7 +45,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   die "Run this installer as root: sudo bash ${SCRIPT_DIR}/setup_siem_alarm_final.sh"
 fi
 
-for command_name in /usr/bin/python3 systemctl systemd-analyze install useradd groupadd getent id chown chmod cp tee date; do
+for command_name in /usr/bin/python3 dpkg-query filebeat openssl systemctl systemd-analyze install useradd groupadd getent id chown chmod cp tee date; do
   command -v "${command_name}" >/dev/null 2>&1 || die "Required command not found: ${command_name}"
 done
 
@@ -50,11 +53,41 @@ for file_name in "${required_files[@]}"; do
   [[ -f "${SCRIPT_DIR}/${file_name}" ]] || die "Required source file not found: ${SCRIPT_DIR}/${file_name}"
 done
 
+check_package_version() {
+  local package_name="$1"
+  local expected_version="$2"
+  local installed_version normalized_version
+  installed_version="$(dpkg-query -W -f='${Version}' "${package_name}" 2>/dev/null)" \
+    || die "Required Ubuntu package is not installed: ${package_name}"
+  normalized_version="${installed_version#*:}"
+  case "${normalized_version}" in
+    "${expected_version}"|"${expected_version}"-*|"${expected_version}"+*|"${expected_version}"~*) ;;
+    *) die "${package_name} must be ${expected_version}; found ${installed_version}" ;;
+  esac
+  echo "[+] Version OK: ${package_name} ${installed_version}"
+}
+
+check_package_version wazuh-manager "${EXPECTED_WAZUH_VERSION}"
+check_package_version wazuh-indexer "${EXPECTED_WAZUH_VERSION}"
+check_package_version wazuh-dashboard "${EXPECTED_WAZUH_VERSION}"
+check_package_version filebeat "${EXPECTED_FILEBEAT_VERSION}"
+
 for wazuh_unit in wazuh-manager.service wazuh-indexer.service wazuh-dashboard.service filebeat.service; do
   systemctl cat "${wazuh_unit}" >/dev/null 2>&1 || die "Required Wazuh AIO unit not found: ${wazuh_unit}"
+  systemctl is-active --quiet "${wazuh_unit}" || die "Required Wazuh AIO unit is not active: ${wazuh_unit}"
 done
 
 [[ -f "${CA_SOURCE}" ]] || die "Wazuh root CA not found: ${CA_SOURCE}. Set WAZUH_CA_SOURCE if its path differs."
+[[ -f "${INDEXER_CERT_SOURCE}" ]] \
+  || die "Wazuh Indexer certificate not found: ${INDEXER_CERT_SOURCE}. Set WAZUH_INDEXER_CERT_SOURCE if its path differs."
+openssl x509 -checkend 86400 -noout -in "${CA_SOURCE}" >/dev/null \
+  || die "Wazuh root CA is invalid or expires within 24 hours: ${CA_SOURCE}"
+openssl x509 -checkend 86400 -noout -in "${INDEXER_CERT_SOURCE}" >/dev/null \
+  || die "Wazuh Indexer certificate is invalid or expires within 24 hours: ${INDEXER_CERT_SOURCE}"
+openssl verify -purpose sslserver -CAfile "${CA_SOURCE}" "${INDEXER_CERT_SOURCE}" >/dev/null \
+  || die "Wazuh Indexer certificate does not verify against ${CA_SOURCE}"
+filebeat test output >/dev/null \
+  || die "Filebeat cannot connect securely to the Wazuh Indexer"
 
 PYTHON_VERSION="$(/usr/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 PYTHON_OK="$(/usr/bin/python3 -c 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')"
@@ -282,7 +315,7 @@ echo "    ${BASE_DIR}/assets.json"
 echo "    ${CONFIG_DIR}/siem-alarm.env"
 echo
 echo "[+] Recommended next document:"
-echo "    ${SCRIPT_DIR}/final_checklist_siem_alarm_wazuh_4_14_2.md"
+echo "    ${SCRIPT_DIR}/final_checklist_siem_alarm_wazuh_4_14_7.md"
 if [[ -d "${BACKUP_DIR}" ]]; then
   echo "[+] Replaced files were backed up to ${BACKUP_DIR}"
 fi

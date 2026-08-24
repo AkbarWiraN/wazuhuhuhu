@@ -1,6 +1,8 @@
-# SIEM Alarm Scoring for Wazuh 4.14.x
+# SIEM Alarm Scoring for Wazuh 4.14.7
 
 Progressive alarm aggregation for a single-node/all-in-one Wazuh deployment. Raw evidence in `wazuh-alerts-*` is read-only; aggregated state and immutable escalation events are written to `siem-alarm-*`.
+
+Target yang divalidasi adalah Ubuntu AIO dengan `wazuh-manager`, `wazuh-indexer`, dan `wazuh-dashboard` 4.14.7 serta Filebeat OSS 7.10.2. Installer menolak versi yang berbeda.
 
 ## Safety status
 
@@ -28,7 +30,7 @@ sudo bash ./setup_siem_alarm_final.sh
 
 The installer does not enable the timer. Continue with the complete production checklist before go-live:
 
-- [Production checklist](final_checklist_siem_alarm_wazuh_4_14_2.md)
+- [Production checklist](final_checklist_siem_alarm_wazuh_4_14_7.md)
 - Example runtime configuration: `config.siem_alarm.example.json`
 - Example asset inventory: `assets.example.json`
 - Index template: `siem_alarm_template_final.json`
