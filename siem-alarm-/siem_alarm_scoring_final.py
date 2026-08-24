@@ -14,12 +14,11 @@ Core design:
 - source.raw_alert_count == alarm.event_count == risk.frequency_count_1h.
 
 Dependencies:
-- Python 3 standard library only.
+- Python 3.9+ standard library only.
+- Linux fcntl process locking.
 
 Example:
-sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
-  --once
+sudo systemctl start siem-alarm-scoring.service
 """
 
 from __future__ import annotations
@@ -27,11 +26,13 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import contextlib
 import datetime as dt
 import hashlib
 import json
 import logging
 import os
+import random
 import re
 import ssl
 import sys
@@ -40,6 +41,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the production target is Linux.
+    fcntl = None
 
 
 def utc_now() -> dt.datetime:
@@ -57,7 +63,10 @@ def parse_dt(value: Any) -> Optional[dt.datetime]:
     if not text:
         return None
     try:
-        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed
     except Exception:
         return None
 
@@ -141,10 +150,33 @@ def flatten(data: Any, prefix: str = "") -> Dict[str, Any]:
     return output
 
 
+class OpenSearchHTTPError(RuntimeError):
+    def __init__(self, status: int, method: str, url: str, body: str):
+        self.status = status
+        self.method = method
+        self.url = url
+        self.body = body
+        super().__init__(f"OpenSearch HTTP {status} {method} {url}: {body}")
+
+
 class OpenSearchClient:
-    def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = False, ca_cert: Optional[str] = None, timeout: int = 60):
+    RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        verify_ssl: bool = True,
+        ca_cert: Optional[str] = None,
+        timeout: int = 60,
+        retry_attempts: int = 4,
+        retry_backoff_seconds: float = 1.0,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.retry_attempts = max(1, retry_attempts)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
         if verify_ssl:
             self.ctx = ssl.create_default_context(cafile=ca_cert) if ca_cert else ssl.create_default_context()
         else:
@@ -162,15 +194,35 @@ class OpenSearchClient:
             url += "?" + urllib.parse.urlencode(params)
         data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self.headers, method=method.upper())
-        try:
-            with urllib.request.urlopen(req, context=self.ctx, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenSearch HTTP {exc.code} {method} {url}: {error_body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"OpenSearch connection error {method} {url}: {exc}") from exc
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                with urllib.request.urlopen(req, context=self.ctx, timeout=self.timeout) as response:
+                    raw = response.read().decode("utf-8")
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                error = OpenSearchHTTPError(exc.code, method, url, error_body)
+                if exc.code not in self.RETRYABLE_HTTP_STATUSES or attempt == self.retry_attempts:
+                    raise error from exc
+                self._wait_before_retry(attempt, error)
+            except urllib.error.URLError as exc:
+                error = RuntimeError(f"OpenSearch connection error {method} {url}: {exc}")
+                if attempt == self.retry_attempts:
+                    raise error from exc
+                self._wait_before_retry(attempt, error)
+        raise RuntimeError(f"OpenSearch request exhausted retries: {method} {url}")
+
+    def _wait_before_retry(self, attempt: int, error: Exception) -> None:
+        delay = self.retry_backoff_seconds * (2 ** (attempt - 1))
+        delay += random.uniform(0, min(1.0, delay * 0.25)) if delay else 0.0
+        logging.warning(
+            "OpenSearch request failed (attempt %d/%d): %s; retrying in %.2fs",
+            attempt,
+            self.retry_attempts,
+            error,
+            delay,
+        )
+        time.sleep(delay)
 
     def put_template(self, name: str, template: Dict[str, Any]) -> Dict[str, Any]:
         return self.request("PUT", f"_index_template/{name}", template)
@@ -179,12 +231,22 @@ class OpenSearchClient:
         quoted = urllib.parse.quote(doc_id, safe="")
         return self.request("PUT", f"{index}/_doc/{quoted}", doc)
 
+    def create_doc_if_absent(self, index: str, doc_id: str, doc: Dict[str, Any]) -> bool:
+        quoted = urllib.parse.quote(doc_id, safe="")
+        try:
+            self.request("PUT", f"{index}/_create/{quoted}", doc)
+            return True
+        except OpenSearchHTTPError as exc:
+            if exc.status == 409:
+                return False
+            raise
+
     def get_doc(self, index: str, doc_id: str) -> Optional[Dict[str, Any]]:
         quoted = urllib.parse.quote(doc_id, safe="")
         try:
             response = self.request("GET", f"{index}/_doc/{quoted}")
-        except RuntimeError as exc:
-            if "OpenSearch HTTP 404" in str(exc):
+        except OpenSearchHTTPError as exc:
+            if exc.status == 404:
                 return None
             raise
         if not response.get("found", False):
@@ -300,12 +362,62 @@ def load_json(path: str, default: Any) -> Any:
 
 
 def setup_logging(log_file: str, level: str) -> None:
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    log_directory = os.path.dirname(os.path.abspath(log_file))
+    os.makedirs(log_directory, exist_ok=True)
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
     )
+
+
+@contextlib.contextmanager
+def process_lock(lock_file: str) -> Iterable[None]:
+    if fcntl is None:
+        raise RuntimeError("Process locking requires Linux/fcntl")
+    lock_directory = os.path.dirname(os.path.abspath(lock_file))
+    os.makedirs(lock_directory, exist_ok=True)
+    with open(lock_file, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Another scoring process holds lock: {lock_file}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def validate_search_response(response: Dict[str, Any], context: str) -> None:
+    if response.get("timed_out") is True:
+        raise RuntimeError(f"OpenSearch search timed out during {context}")
+    shards = response.get("_shards", {})
+    failed = to_int(shards.get("failed"), 0) if isinstance(shards, dict) else 0
+    if failed > 0:
+        failures = shards.get("failures", []) if isinstance(shards, dict) else []
+        raise RuntimeError(f"OpenSearch reported {failed} failed shard(s) during {context}: {failures}")
+
+
+def required_alert_errors(alert: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    timestamp = first_value(alert, ["timestamp"], None)
+    if parse_dt(timestamp) is None:
+        errors.append("timestamp must contain an ISO-8601 timezone")
+    for path in ["agent.id", "rule.id", "rule.description"]:
+        if first_value(alert, [path], None) in (None, "", "-", "null", "None"):
+            errors.append(f"{path} is required")
+    raw_level = first_value(alert, ["rule.level"], None)
+    try:
+        level = int(str(raw_level))
+        if not 0 <= level <= 15:
+            errors.append("rule.level must be between 0 and 15")
+    except (TypeError, ValueError):
+        errors.append("rule.level must be an integer")
+    return errors
 
 
 def get_rule_groups(alert: Dict[str, Any]) -> List[str]:
@@ -509,6 +621,7 @@ def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte
     max_alerts = int(config.get("max_alerts_per_run", 50000))
     emitted = 0
     response = client.search(config.get("source_index", "wazuh-alerts-*"), body, {"scroll": keepalive})
+    validate_search_response(response, "initial alert search")
     scroll_id = response.get("_scroll_id")
 
     try:
@@ -531,6 +644,7 @@ def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte
             if not scroll_id:
                 break
             response = client.scroll(scroll_id, keepalive)
+            validate_search_response(response, "alert scroll")
             scroll_id = response.get("_scroll_id", scroll_id)
     finally:
         if scroll_id:
@@ -576,9 +690,22 @@ def rule_level_counts(counter: collections.Counter) -> List[Dict[str, int]]:
 def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = {}
     bucket_minutes = int(config.get("bucket_minutes", 60))
+    skipped = 0
 
     for source_index, doc_id, alert in alerts:
-        ts = parse_dt(first_value(alert, ["timestamp"], None)) or utc_now()
+        errors = required_alert_errors(alert)
+        if errors:
+            skipped += 1
+            if skipped <= 10:
+                logging.warning(
+                    "Skipping malformed alert index=%s id=%s: %s",
+                    source_index,
+                    doc_id,
+                    "; ".join(errors),
+                )
+            continue
+        ts = parse_dt(first_value(alert, ["timestamp"], None))
+        assert ts is not None
         bucket_iso = iso_z(bucket_start(ts, bucket_minutes))
         observed = extract_observed(alert)
         case_key, mode, key_fields = build_case_key(alert, observed, bucket_iso, config)
@@ -626,6 +753,8 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
             if value:
                 bucket[field][value] += 1
 
+    if skipped:
+        logging.warning("Skipped malformed alerts: %d (details limited to first 10)", skipped)
     return buckets
 
 
@@ -839,11 +968,17 @@ def build_escalation_doc(state_doc: Dict[str, Any]) -> Tuple[str, Dict[str, Any]
     return event_id, doc
 
 
-def template() -> Dict[str, Any]:
+def template(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    destination_prefix = (config or {}).get("destination_index_prefix", "siem-alarm")
     keyword = {"type": "keyword", "ignore_above": 2048}
     return {
-        "index_patterns": ["siem-alarm-*"],
+        "index_patterns": [f"{destination_prefix}-*"],
         "priority": 300,
+        "version": 1,
+        "_meta": {
+            "managed_by": "siem-alarm-scoring",
+            "schema_version": "1",
+        },
         "template": {
             "settings": {
                 "number_of_shards": 1,
@@ -1029,14 +1164,16 @@ def run_once(config: Dict[str, Any], gte_override: Optional[str] = None, lte_ove
         config["opensearch_url"],
         config["username"],
         config["password"],
-        bool(config.get("verify_ssl", False)),
+        bool(config.get("verify_ssl", True)),
         config.get("ca_cert"),
         int(config.get("timeout", 60)),
+        int(config.get("retry_attempts", 4)),
+        float(config.get("retry_backoff_seconds", 1.0)),
     )
 
-    if config.get("install_template", True):
+    if config.get("install_template", False):
         logging.info("Installing/updating index template: %s", config.get("template_name", "siem-alarm-template"))
-        client.put_template(config.get("template_name", "siem-alarm-template"), template())
+        client.put_template(config.get("template_name", "siem-alarm-template"), template(config))
 
     assets = load_json(config.get("assets_file", "/opt/wazuh-risk-scoring/assets.json"), {})
     bucket_minutes = int(config.get("bucket_minutes", 60))
@@ -1084,12 +1221,19 @@ def run_once(config: Dict[str, Any], gte_override: Optional[str] = None, lte_ove
         doc_id = make_id(bucket["case_key"])
         existing_doc = client.get_doc(destination_index, doc_id)
         doc_id, doc = build_doc(bucket, config, existing_doc)
-        client.index_doc(destination_index, doc_id, doc)
-        written += 1
         if doc.get("risk", {}).get("escalation_log_required"):
             escalation_id, escalation_doc = build_escalation_doc(doc)
-            client.index_doc(destination_index, escalation_id, escalation_doc)
-            written += 1
+            created = client.create_doc_if_absent(destination_index, escalation_id, escalation_doc)
+            if created:
+                written += 1
+                logging.info("Created escalation document: %s", escalation_id)
+            else:
+                logging.info("Escalation document already exists: %s", escalation_id)
+        # State is written after the immutable escalation event. If this write
+        # fails, the next run retries the same deterministic escalation ID and
+        # then advances state without losing the event.
+        client.index_doc(destination_index, doc_id, doc)
+        written += 1
 
     logging.info("Written/updated documents: %d indices=%s", written, sorted(destination_indices))
     return written
@@ -1099,9 +1243,142 @@ def load_config(path: str) -> Dict[str, Any]:
     config = load_json(path, None)
     if not isinstance(config, dict):
         raise RuntimeError(f"Invalid config file: {path}")
-    for key in ["opensearch_url", "username", "password"]:
+    for key in ["opensearch_url", "username"]:
         if not config.get(key):
             raise RuntimeError(f"Missing required config key: {key}")
+
+    opensearch_url = str(config["opensearch_url"])
+    if not opensearch_url.startswith("https://"):
+        raise RuntimeError("opensearch_url must use https://")
+
+    password_env = str(config.get("password_env", "WAZUH_PASS"))
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", password_env):
+        raise RuntimeError("password_env must be a valid uppercase environment variable name")
+
+    password = config.get("password")
+    if not password or str(password).startswith(("GANTI_", "CHANGE_")):
+        password = os.environ.get(password_env)
+    if not password or str(password).startswith(("GANTI_", "CHANGE_")):
+        raise RuntimeError(
+            f"Indexer password is missing; set environment variable {password_env} "
+            "or provide a non-placeholder password"
+        )
+    config = dict(config)
+    config["password"] = str(password)
+
+    integer_defaults = {
+        "timeout": 60,
+        "retry_attempts": 4,
+        "bucket_minutes": 60,
+        "lookback_minutes": 60,
+        "lookback_overlap_minutes": 7,
+        "max_alerts_per_run": 50000,
+        "page_size": 1000,
+        "evidence_sample_limit": 20,
+        "evidence_top_limit": 10,
+    }
+    integer_ranges = {
+        "timeout": (1, 600),
+        "retry_attempts": (1, 10),
+        "bucket_minutes": (1, 1440),
+        "lookback_minutes": (1, 10080),
+        "lookback_overlap_minutes": (0, 1440),
+        "max_alerts_per_run": (1, 10_000_000),
+        "page_size": (1, 10000),
+        "evidence_sample_limit": (1, 1000),
+        "evidence_top_limit": (1, 1000),
+    }
+    for key, (minimum, maximum) in integer_ranges.items():
+        try:
+            value = int(config.get(key, integer_defaults[key]))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Config {key} must be an integer") from exc
+        if not minimum <= value <= maximum:
+            raise RuntimeError(f"Config {key} must be between {minimum} and {maximum}")
+        config[key] = value
+
+    try:
+        retry_backoff = float(config.get("retry_backoff_seconds", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("retry_backoff_seconds must be numeric") from exc
+    if not 0.1 <= retry_backoff <= 60.0:
+        raise RuntimeError("retry_backoff_seconds must be between 0.1 and 60")
+    config["retry_backoff_seconds"] = retry_backoff
+
+    for key, default in {
+        "verify_ssl": True,
+        "install_template": False,
+        "process_current_bucket_only": True,
+        "escalation_log_enabled": True,
+    }.items():
+        value = config.get(key, default)
+        if not isinstance(value, bool):
+            raise RuntimeError(f"Config {key} must be true or false")
+        config[key] = value
+
+    bucket_minutes = config["bucket_minutes"]
+    if 1440 % bucket_minutes != 0:
+        raise RuntimeError("bucket_minutes must divide evenly into 1440 minutes")
+
+    prefix = str(config.get("destination_index_prefix", "siem-alarm"))
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", prefix):
+        raise RuntimeError("destination_index_prefix must be lowercase and OpenSearch-safe")
+    config["destination_index_prefix"] = prefix
+
+    mode = str(config.get("deduplication_mode", "coarse"))
+    allowed_modes = {"coarse", "target_aware", "target_port_aware", "file_aware"}
+    if mode not in allowed_modes:
+        raise RuntimeError(f"deduplication_mode must be one of {sorted(allowed_modes)}")
+    config["deduplication_mode"] = mode
+
+    rule_overrides = config.get("rule_overrides", {})
+    if not isinstance(rule_overrides, dict):
+        raise RuntimeError("rule_overrides must be an object")
+    for rule_id, override in rule_overrides.items():
+        if not isinstance(override, dict):
+            raise RuntimeError(f"rule_overrides.{rule_id} must be an object")
+        override_mode = str(override.get("deduplication_mode", mode))
+        if override_mode not in allowed_modes:
+            raise RuntimeError(
+                f"rule_overrides.{rule_id}.deduplication_mode must be one of {sorted(allowed_modes)}"
+            )
+
+    strategy = str(config.get("threat_level_strategy", "max")).lower()
+    if strategy not in {"max", "mode", "median"}:
+        raise RuntimeError("threat_level_strategy must be max, mode, or median")
+    config["threat_level_strategy"] = strategy
+
+    configured_levels = config.get("escalation_log_levels", ["Medium", "High", "Critical"])
+    valid_levels = {"Information", "Low", "Medium", "High", "Critical"}
+    if not isinstance(configured_levels, list) or not configured_levels:
+        raise RuntimeError("escalation_log_levels must be a non-empty array")
+    if any(str(level) not in valid_levels for level in configured_levels):
+        raise RuntimeError(f"escalation_log_levels must only contain {sorted(valid_levels)}")
+    config["escalation_log_levels"] = [str(level) for level in configured_levels]
+
+    min_rule_level = config.get("min_rule_level")
+    if min_rule_level is not None:
+        try:
+            min_rule_level = int(min_rule_level)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("min_rule_level must be null or an integer") from exc
+        if not 0 <= min_rule_level <= 15:
+            raise RuntimeError("min_rule_level must be between 0 and 15")
+        config["min_rule_level"] = min_rule_level
+
+    for key in ["excluded_rule_ids", "excluded_rule_groups"]:
+        if not isinstance(config.get(key, []), list):
+            raise RuntimeError(f"{key} must be an array")
+
+    for key in ["log_file", "assets_file", "lock_file"]:
+        value = str(config.get(key, ""))
+        if value and not os.path.isabs(value):
+            raise RuntimeError(f"{key} must be an absolute path")
+
+    if config["verify_ssl"]:
+        ca_cert = config.get("ca_cert")
+        if ca_cert and not os.path.isfile(str(ca_cert)):
+            raise RuntimeError(f"CA certificate not found: {ca_cert}")
     return config
 
 
@@ -1113,6 +1390,11 @@ def main() -> int:
     parser.add_argument("--interval", type=int, default=300)
     parser.add_argument("--from", dest="from_time", help="Manual backfill start time, e.g. 2026-05-22T10:00:00Z")
     parser.add_argument("--to", dest="to_time", help="Manual backfill end time, defaults to now if omitted")
+    parser.add_argument(
+        "--install-template-only",
+        action="store_true",
+        help="Install/update the destination index template and exit",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -1125,17 +1407,49 @@ def main() -> int:
         logging.error("--to requires --from")
         return 2
 
+    if args.from_time and args.to_time:
+        parsed_from = parse_dt(args.from_time)
+        parsed_to = parse_dt(args.to_time)
+        if parsed_from is None or parsed_to is None or parsed_from >= parsed_to:
+            logging.error("--from must be earlier than --to and both must include a timezone")
+            return 2
+
+    lock_file = str(config.get("lock_file", "/opt/wazuh-risk-scoring/logs/scoring.lock"))
+
+    if args.install_template_only:
+        try:
+            with process_lock(lock_file):
+                client = OpenSearchClient(
+                    config["opensearch_url"],
+                    config["username"],
+                    config["password"],
+                    bool(config.get("verify_ssl", True)),
+                    config.get("ca_cert"),
+                    int(config.get("timeout", 60)),
+                    int(config.get("retry_attempts", 4)),
+                    float(config.get("retry_backoff_seconds", 1.0)),
+                )
+                name = config.get("template_name", "siem-alarm-template")
+                client.put_template(name, template(config))
+                logging.info("Installed/updated index template: %s", name)
+            return 0
+        except Exception:
+            logging.exception("Template installation failed")
+            return 1
+
     if args.loop:
         while True:
             try:
-                run_once(config)
+                with process_lock(lock_file):
+                    run_once(config)
             except Exception:
                 logging.exception("Run failed")
             time.sleep(args.interval)
         return 0
 
     try:
-        run_once(config, args.from_time, args.to_time)
+        with process_lock(lock_file):
+            run_once(config, args.from_time, args.to_time)
         return 0
     except Exception:
         logging.exception("Run failed")

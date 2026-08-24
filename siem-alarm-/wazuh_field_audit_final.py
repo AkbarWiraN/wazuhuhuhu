@@ -23,8 +23,10 @@ import datetime as dt
 import getpass
 import json
 import os
+import random
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,45 +71,86 @@ def get_path(data: Dict[str, Any], path: str, default: Any = None) -> Any:
 
 
 class Client:
-    def __init__(self, url: str, username: str, password: str, verify_ssl: bool):
+    RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
+
+    def __init__(
+        self,
+        url: str,
+        username: str,
+        password: str,
+        verify_ssl: bool,
+        ca_cert: str | None = None,
+        retry_attempts: int = 4,
+    ):
         self.url = url.rstrip("/")
+        self.retry_attempts = max(1, retry_attempts)
         token = base64.b64encode(f"{username}:{password}".encode()).decode()
         self.headers = {
             "Authorization": f"Basic {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        self.ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+        self.ctx = ssl.create_default_context(cafile=ca_cert) if verify_ssl else ssl._create_unverified_context()
 
     def request(self, method: str, path: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
         url = f"{self.url}/{path.lstrip('/')}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self.headers, method=method.upper())
-        try:
-            with urllib.request.urlopen(req, context=self.ctx, timeout=60) as response:
-                raw = response.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                with urllib.request.urlopen(req, context=self.ctx, timeout=60) as response:
+                    raw = response.read().decode("utf-8")
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                body_text = exc.read().decode(errors="replace")
+                if exc.code not in self.RETRYABLE_HTTP_STATUSES or attempt == self.retry_attempts:
+                    raise RuntimeError(f"HTTP {exc.code}: {body_text}") from exc
+                delay = (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                print(f"[!] HTTP {exc.code}; retrying in {delay:.2f}s", file=sys.stderr)
+                time.sleep(delay)
+            except urllib.error.URLError as exc:
+                if attempt == self.retry_attempts:
+                    raise RuntimeError(f"Connection failed: {exc}") from exc
+                delay = (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                print(f"[!] Connection failed; retrying in {delay:.2f}s", file=sys.stderr)
+                time.sleep(delay)
+        raise RuntimeError("Indexer request exhausted retries")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit actual Wazuh alert fields")
     parser.add_argument("--url", default="https://127.0.0.1:9200")
-    parser.add_argument("--user", default="admin")
+    parser.add_argument("--user", default="siem_alarm_service")
     parser.add_argument("--password")
     parser.add_argument("--index", default="wazuh-alerts-*")
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--limit", type=int, default=3000)
-    parser.add_argument("--verify-ssl", action="store_true")
-    parser.add_argument("--output", default="/tmp/wazuh_field_audit_report.json")
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument("--verify-ssl", dest="verify_ssl", action="store_true")
+    tls_group.add_argument("--insecure", dest="verify_ssl", action="store_false")
+    parser.set_defaults(verify_ssl=True)
+    parser.add_argument("--ca-cert", help="CA certificate used with --verify-ssl")
+    parser.add_argument("--retry-attempts", type=int, default=4)
+    parser.add_argument(
+        "--output",
+        default="/opt/wazuh-risk-scoring/logs/wazuh_field_audit_report.json",
+    )
     args = parser.parse_args()
+
+    if args.hours <= 0:
+        parser.error("--hours must be greater than zero")
+    if not 1 <= args.limit <= 10000:
+        parser.error("--limit must be between 1 and 10000")
+    if not 1 <= args.retry_attempts <= 10:
+        parser.error("--retry-attempts must be between 1 and 10")
+    if args.verify_ssl and args.ca_cert and not os.path.isfile(args.ca_cert):
+        parser.error(f"CA certificate not found: {args.ca_cert}")
 
     password = args.password or os.environ.get("WAZUH_PASS")
     if not password:
         password = getpass.getpass("Indexer password: ")
 
-    client = Client(args.url, args.user, password, args.verify_ssl)
+    client = Client(args.url, args.user, password, args.verify_ssl, args.ca_cert, args.retry_attempts)
     gte = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)).isoformat().replace("+00:00", "Z")
 
     body = {
@@ -117,6 +160,11 @@ def main() -> int:
         "_source": True,
     }
     response = client.request("POST", f"{args.index}/_search", body)
+    if response.get("timed_out") is True:
+        raise RuntimeError("Indexer search timed out")
+    shards = response.get("_shards", {})
+    if isinstance(shards, dict) and int(shards.get("failed", 0)) > 0:
+        raise RuntimeError(f"Indexer search has failed shards: {shards.get('failures', [])}")
     hits = response.get("hits", {}).get("hits", [])
 
     all_fields = collections.Counter()
@@ -186,7 +234,17 @@ def main() -> int:
         "rules": sorted(report_rules, key=lambda x: x["count"], reverse=True),
     }
 
-    with open(args.output, "w", encoding="utf-8") as handle:
+    output_directory = os.path.dirname(os.path.abspath(args.output))
+    os.makedirs(output_directory, exist_ok=True)
+    output_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        output_flags |= os.O_NOFOLLOW
+    output_fd = os.open(args.output, output_flags, 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(output_fd, 0o600)
+    else:  # pragma: no cover - the production target is Linux.
+        os.chmod(args.output, 0o600)
+    with os.fdopen(output_fd, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, ensure_ascii=False)
 
     print(f"[+] Sampled alerts: {len(hits)}")

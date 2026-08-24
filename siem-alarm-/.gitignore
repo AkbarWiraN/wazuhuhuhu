@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime secrets and generated output
+config.siem_alarm.json
+assets.json
+*.env
+*.log
+wazuh_field_audit_report.json
+

@@ -3,6 +3,11 @@
     "siem-alarm-*"
   ],
   "priority": 300,
+  "version": 1,
+  "_meta": {
+    "managed_by": "siem-alarm-scoring",
+    "schema_version": "1"
+  },
   "template": {
     "settings": {
       "number_of_shards": 1,

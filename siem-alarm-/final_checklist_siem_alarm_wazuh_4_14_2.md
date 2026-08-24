@@ -1,6 +1,6 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.2 AIO
 
-> **Versi 3.5** — Progressive Alarm + Escalation Log Pattern
+> **Versi 4.0** — Production-hardened Progressive Alarm + Immutable Escalation Log
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
@@ -18,7 +18,10 @@ agent.id + rule.id + timestamp_bucket_1h
 
 - Script jalan **setiap 5 menit**, bucket tetap **1 jam**.
 - `alarm.id` dibuat deterministik dari hash `case_key` → update, bukan duplikasi.
-- Log eskalasi dibuat di `siem-alarm-*` saat risk.level pertama kali masuk Medium/High/Critical atau naik ke level lebih tinggi.
+- Log eskalasi dibuat secara **create-only sebelum state di-update** saat risk.level pertama kali masuk Medium/High/Critical atau naik ke level lebih tinggi.
+- Satu host hanya boleh menjalankan satu proses scoring; lock default: `/opt/wazuh-risk-scoring/logs/scoring.lock`.
+- TLS verification wajib untuk production menggunakan salinan Wazuh root CA.
+- Runtime memakai user Linux dan user Wazuh Indexer khusus `siem-alarm`, bukan `root`/`admin`.
 - Field `srcip`, `dstip`, `dstport`, `proto`, `url`, `user`, `file_path`, `hash`, `CVE`, SCA = **evidence**, bukan pemecah case.
 
 ---
@@ -387,32 +390,46 @@ Tidak ada duplikasi dokumen untuk case_key yang sama dalam satu bucket.
 
 ## 7. Instalasi File
 
-### 7.1 Buat direktori
+### 7.1 Preflight
 
 ```bash
-sudo mkdir -p /opt/wazuh-risk-scoring/logs
-sudo chown -R root:root /opt/wazuh-risk-scoring
-sudo chmod 750 /opt/wazuh-risk-scoring
+cd /path/ke/folder/siem-alarm-
+sudo bash ./setup_siem_alarm_final.sh
 ```
 
-### 7.2 Simpan file
+Installer wajib dijalankan dari paket lengkap, tetapi tidak bergantung pada current directory setelah path script ditemukan. Installer akan:
+
+- Memvalidasi seluruh Python/JSON dan menjalankan automated unit tests sebelum mengubah `/opt` atau systemd.
+- Membuat user/group Linux `siem-alarm`.
+- Menyalin Wazuh CA dari `/etc/wazuh-indexer/certs/root-ca.pem`.
+- Membuat backup file lama di `/opt/wazuh-risk-scoring/backups/<UTC timestamp>`.
+- Mempertahankan config, assets, dan environment file yang sudah ada.
+- Memasang service, timer, dan logrotate tetapi **tidak meng-enable timer**.
+- Menjalankan `systemd-analyze verify`.
+
+Jika CA berada di lokasi lain:
+
+```bash
+sudo WAZUH_CA_SOURCE=/path/root-ca.pem bash ./setup_siem_alarm_final.sh
+```
+
+### 7.2 File hasil instalasi
 
 ```text
 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py
+/opt/wazuh-risk-scoring/wazuh_field_audit_final.py
+/opt/wazuh-risk-scoring/siem_alarm_template_final.json
+/opt/wazuh-risk-scoring/siem_alarm_ism_policy.json
 /opt/wazuh-risk-scoring/config.siem_alarm.json
 /opt/wazuh-risk-scoring/assets.json
-/opt/wazuh-risk-scoring/wazuh_field_audit_final.py
+/opt/wazuh-risk-scoring/root-ca.pem
+/etc/wazuh-risk-scoring/siem-alarm.env
+/etc/systemd/system/siem-alarm-scoring.service
+/etc/systemd/system/siem-alarm-scoring.timer
+/etc/logrotate.d/siem-alarm-scoring
 ```
 
-### 7.3 Permission
-
-```bash
-sudo chown root:root /opt/wazuh-risk-scoring/*
-sudo chmod 750 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py
-sudo chmod 750 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py
-sudo chmod 600 /opt/wazuh-risk-scoring/config.siem_alarm.json
-sudo chmod 640 /opt/wazuh-risk-scoring/assets.json
-```
+> Repository menyimpan script installer sebagai file biasa. Gunakan `sudo bash ./setup_siem_alarm_final.sh`; tidak perlu mengandalkan executable bit.
 
 ---
 
@@ -429,26 +446,31 @@ sudo systemctl status filebeat
 
 ### 8.2 Cek koneksi indexer
 
-> **Keamanan**: Jangan ketik password langsung di command line — tersimpan di bash history.
+Sebelum test, buat internal user `siem_alarm_service` dan custom role melalui **Indexer Management → Security** dengan prinsip least privilege:
 
-**Cara aman — input interaktif:**
+- Read/search pada `wazuh-alerts-*`.
+- Create index dan create/update document pada `siem-alarm-*`.
+- Tidak diberi akses ke Security API, system index, atau index Wazuh lain.
+- Template dan ISM policy dipasang satu kali memakai administrator; runtime account tidak memerlukan cluster-admin.
+
+Gunakan input password interaktif dan verifikasi CA. Jangan memasukkan password ke argumen command.
+
 ```bash
-curl -k -u admin https://127.0.0.1:9200
+curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user siem_alarm_service \
+  https://127.0.0.1:9200
 ```
 
-**Cara aman — environment variable:**
-```bash
-export WAZUH_PASS='PASSWORD_INDEXER'
-curl -k -u admin:"$WAZUH_PASS" https://127.0.0.1:9200
-unset WAZUH_PASS
-```
+> Jika certificate SAN tidak memuat `127.0.0.1`, ganti URL dengan hostname/IP yang tercantum pada sertifikat. Jangan kembali memakai `-k` di production.
 
 ### 8.3 Cek raw alert
 
 ```bash
-export WAZUH_PASS='PASSWORD_INDEXER'
-curl -k -u admin:"$WAZUH_PASS" "https://127.0.0.1:9200/wazuh-alerts-*/_search?size=1&pretty"
-unset WAZUH_PASS
+curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user siem_alarm_service \
+  "https://127.0.0.1:9200/wazuh-alerts-*/_search?size=1&pretty"
 ```
 
 ---
@@ -461,27 +483,32 @@ Field Wazuh bersifat dynamic tergantung decoder. Audit wajib dilakukan sebelum p
 
 ### 9.2 Jalankan audit
 
-**Cara aman — environment variable:**
+**Cara aman — input interaktif + CA verification:**
+
 ```bash
-export WAZUH_PASS='PASSWORD_INDEXER'
-sudo -E python3 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
+sudo -u siem-alarm /usr/bin/python3 -B \
+  /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
   --url https://127.0.0.1:9200 \
-  --user admin \
+  --user siem_alarm_service \
+  --verify-ssl \
+  --ca-cert /opt/wazuh-risk-scoring/root-ca.pem \
   --hours 24 \
   --limit 3000 \
-  --output /tmp/wazuh_field_audit_report.json
-unset WAZUH_PASS
+  --output /opt/wazuh-risk-scoring/logs/wazuh_field_audit_report.json
 ```
 
-**Cara aman — input interaktif:**
+Jika hanya untuk diagnosis sertifikat, opsi `--insecure` tersedia. Jangan gunakan sebagai konfigurasi production permanen.
+
 ```bash
-sudo python3 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
+sudo -u siem-alarm /usr/bin/python3 -B \
+  /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
   --url https://127.0.0.1:9200 \
-  --user admin \
-  --hours 24 \
-  --limit 3000 \
-  --output /tmp/wazuh_field_audit_report.json
+  --user siem_alarm_service \
+  --insecure --hours 1 --limit 100 \
+  --output /opt/wazuh-risk-scoring/logs/wazuh_field_audit_report.json
 ```
+
+Laporan dibuat dengan mode `0600` dan penulisan melalui symbolic link ditolak pada Linux.
 
 ### 9.3 Yang harus dicek dari laporan
 
@@ -502,11 +529,37 @@ sudo python3 /opt/wazuh-risk-scoring/wazuh_field_audit_final.py \
 
 ## 10. Buat Index Template
 
-### 10.1 Via script
+### 10.1 Instalasi satu kali
+
+Runtime tidak lagi meng-install template setiap 5 menit:
 
 ```json
-"install_template": true
+"install_template": false
 ```
+
+Install template satu kali menggunakan administrator Indexer; `--user admin` akan meminta password secara interaktif:
+
+```bash
+sudo curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user admin \
+  -H 'Content-Type: application/json' \
+  -X PUT 'https://127.0.0.1:9200/_index_template/siem-alarm-template' \
+  --data-binary @/opt/wazuh-risk-scoring/siem_alarm_template_final.json
+```
+
+Install retention policy 90 hari satu kali. Sesuaikan `min_index_age` di file sebelum command bila kebijakan organisasi berbeda:
+
+```bash
+sudo curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user admin \
+  -H 'Content-Type: application/json' \
+  -X PUT 'https://127.0.0.1:9200/_plugins/_ism/policies/siem-alarm-retention-90d' \
+  --data-binary @/opt/wazuh-risk-scoring/siem_alarm_ism_policy.json
+```
+
+> Jika `destination_index_prefix` bukan `siem-alarm`, ubah `index_patterns` pada kedua file JSON sebelum instalasi. Fungsi template internal Python otomatis mengikuti prefix config, tetapi file manual harus tetap disinkronkan.
 
 ### 10.2 Pastikan mapping mencakup field baru
 
@@ -572,7 +625,7 @@ Field berikut harus ada di template:
 }
 ```
 
-> **Catatan sinkronisasi template**: `siem_alarm_template_final.json` dan fungsi `template()` di `siem_alarm_scoring_final.py` harus selalu di-update bersama. Script meng-install template dari fungsi `template()`, sedangkan file JSON dipakai untuk Dev Tools/manual review.
+> **Catatan sinkronisasi template**: `siem_alarm_template_final.json` dan fungsi `template()` di `siem_alarm_scoring_final.py` harus selalu di-update bersama. Automated test memverifikasi keduanya identik untuk prefix default.
 
 ### 10.3 Via Dev Tools
 
@@ -587,13 +640,22 @@ Wazuh Dashboard → Indexer Management → Dev Tools
 ### 11.1 Edit config
 
 ```bash
-sudo nano /opt/wazuh-risk-scoring/config.siem_alarm.json
+sudoedit /opt/wazuh-risk-scoring/config.siem_alarm.json
+sudoedit /opt/wazuh-risk-scoring/assets.json
+sudoedit /etc/wazuh-risk-scoring/siem-alarm.env
 ```
 
 Pastikan config memakai nama key yang memang dibaca oleh script:
 
 ```json
 {
+  "opensearch_url": "https://127.0.0.1:9200",
+  "username": "siem_alarm_service",
+  "password_env": "WAZUH_PASS",
+  "verify_ssl": true,
+  "ca_cert": "/opt/wazuh-risk-scoring/root-ca.pem",
+  "retry_attempts": 4,
+  "retry_backoff_seconds": 1.0,
   "bucket_minutes": 60,
   "lookback_minutes": 60,
   "process_current_bucket_only": true,
@@ -602,40 +664,50 @@ Pastikan config memakai nama key yang memang dibaca oleh script:
   "escalation_log_levels": ["Medium", "High", "Critical"],
   "threat_level_strategy": "max",
   "max_alerts_per_run": 50000,
-  "password": "GANTI_PASSWORD_INDEXER_ANDA",
-  "install_template": true
+  "lock_file": "/opt/wazuh-risk-scoring/logs/scoring.lock",
+  "install_template": false
 }
 ```
 
-Interval eksekusi 5 menit diatur oleh systemd timer `OnUnitActiveSec=5min`, bukan oleh key `schedule_interval_minutes` di config.
+Environment file root-only harus berisi password sebenarnya:
+
+```text
+WAZUH_PASS="PASSWORD_INDEXER_SEBENARNYA"
+```
+
+Program menolak placeholder `GANTI_*`/`CHANGE_*`, prefix index yang tidak aman, numeric limit di luar batas, CA yang tidak ada, dan bucket yang tidak membagi 1 hari secara utuh.
+
+Interval eksekusi 5 menit diatur oleh systemd timer `OnCalendar=*-*-* *:0/5:00`, bukan oleh key `schedule_interval_minutes` di config.
 Mode `--loop` tersedia di script untuk testing, tetapi tidak direkomendasikan untuk production. Untuk production gunakan systemd timer.
 
 ### 11.2 Test syntax
 
 ```bash
-sudo python3 -m py_compile /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py
+sudo -u siem-alarm /usr/bin/python3 -B \
+  /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py --help >/dev/null
 ```
 
 ### 11.3 Run manual (--once)
 
 ```bash
-sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
-  --once
+sudo systemctl start siem-alarm-scoring.service
+sudo systemctl show siem-alarm-scoring.service -p Result -p ExecMainStatus
 ```
 
 ### 11.4 Cek log
 
 ```bash
 sudo tail -n 100 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
+sudo journalctl -u siem-alarm-scoring.service -n 100 --no-pager
 ```
 
 ### 11.5 Cek index
 
 ```bash
-export WAZUH_PASS='PASSWORD_INDEXER'
-curl -k -u admin:"$WAZUH_PASS" "https://127.0.0.1:9200/_cat/indices/siem-alarm-*?v"
-unset WAZUH_PASS
+curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user siem_alarm_service \
+  "https://127.0.0.1:9200/_cat/indices/siem-alarm-*?v"
 ```
 
 ### 11.6 Validasi progressive update
@@ -644,12 +716,12 @@ Jalankan script dua kali dengan jeda, pastikan `raw_alert_count` bertambah dan d
 
 ```bash
 # Run pertama
-sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json --once
+sudo systemctl start siem-alarm-scoring.service
 
 # Ambil alarm_state terbaru dan catat alarm.id + raw_alert_count
-export WAZUH_PASS='PASSWORD_INDEXER'
-curl -k -u admin:"$WAZUH_PASS" -X GET \
+curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user siem_alarm_service -X GET \
   "https://127.0.0.1:9200/siem-alarm-*/_search?pretty" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -658,14 +730,12 @@ curl -k -u admin:"$WAZUH_PASS" -X GET \
     "query": { "term": { "document.type": "alarm_state" } },
     "_source": ["alarm.id", "alarm.case_key", "alarm.last_seen", "source.raw_alert_count", "risk.level"]
   }'
-unset WAZUH_PASS
 
 # Tunggu 5 menit atau tunggu alert baru masuk
 sleep 300
 
 # Run kedua
-sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json --once
+sudo systemctl start siem-alarm-scoring.service
 
 # Cek ulang query di atas: alarm.id sama, raw_alert_count bertambah
 ```
@@ -678,63 +748,71 @@ sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
 
 ### 12.1 Buat systemd service unit
 
-```bash
-sudo nano /etc/systemd/system/siem-alarm-scoring.service
-```
+File ini dibuat otomatis oleh installer. Gunakan isi berikut untuk review:
 
 ```ini
 [Unit]
 Description=SIEM Alarm Scoring - Wazuh Progressive Alarm Aggregation
-After=network.target wazuh-indexer.service
-Wants=wazuh-indexer.service
+After=network-online.target wazuh-indexer.service
+Wants=network-online.target wazuh-indexer.service
 
 [Service]
 Type=oneshot
-User=root
-ExecStart=/usr/bin/python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
-  --once
-StandardOutput=append:/opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
-StandardError=append:/opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
+User=siem-alarm
+Group=siem-alarm
+EnvironmentFile=/etc/wazuh-risk-scoring/siem-alarm.env
+ExecStart=/usr/bin/python3 -B /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py --config /opt/wazuh-risk-scoring/config.siem_alarm.json --once
 WorkingDirectory=/opt/wazuh-risk-scoring
-
-[Install]
-WantedBy=multi-user.target
+RuntimeDirectory=siem-alarm
+RuntimeDirectoryMode=0750
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wazuh-risk-scoring/logs
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 ```
 
 ### 12.2 Buat systemd timer unit
 
-```bash
-sudo nano /etc/systemd/system/siem-alarm-scoring.timer
-```
+File ini juga dibuat otomatis oleh installer:
 
 ```ini
 [Unit]
 Description=SIEM Alarm Scoring Timer - update alarm setiap 5 menit, bucket 1 jam
-Requires=siem-alarm-scoring.service
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnCalendar=*-*-* *:0/5:00
 AccuracySec=30s
 Persistent=true
+Unit=siem-alarm-scoring.service
 
 [Install]
 WantedBy=timers.target
 ```
 
 > **Catatan konfigurasi timer:**
-> - `OnBootSec=2min` — tunggu 2 menit setelah boot sebelum run pertama, beri waktu wazuh-indexer siap.
-> - `OnUnitActiveSec=5min` — jalankan tiap 5 menit setelah run sebelumnya selesai.
+> - `OnCalendar=*-*-* *:0/5:00` — jalankan pada menit 00/05/10/... setiap jam.
 > - `AccuracySec=30s` — toleransi 30 detik, cukup presisi untuk SOC tanpa membebani scheduler.
-> - `Persistent=true` — jika server sempat mati dan melewati jadwal, langsung jalankan saat boot.
+> - `Persistent=true` — efektif karena timer memakai `OnCalendar`; satu catch-up run dijalankan setelah jadwal terlewat.
+> - Tidak ada `Requires=siem-alarm-scoring.service`; timer akan mengaktifkan service bernama sama ketika jadwal tiba tanpa menjalankannya prematur saat timer di-start.
 
 ### 12.3 Reload dan enable
 
 ```bash
+sudo systemd-analyze verify \
+  /etc/systemd/system/siem-alarm-scoring.service \
+  /etc/systemd/system/siem-alarm-scoring.timer
 sudo systemctl daemon-reload
-sudo systemctl enable siem-alarm-scoring.timer
-sudo systemctl start siem-alarm-scoring.timer
+sudo systemctl enable --now siem-alarm-scoring.timer
 ```
 
 ### 12.4 Validasi timer aktif
@@ -780,8 +858,8 @@ sudo tail -n 100 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
 
 **Cek python path:**
 ```bash
-which python3
-# Sesuaikan ExecStart jika path berbeda dari /usr/bin/python3
+test -x /usr/bin/python3 && /usr/bin/python3 --version
+# Installer berhenti sebelum mutasi jika /usr/bin/python3 tidak tersedia.
 ```
 
 **Reset setelah perubahan:**
@@ -797,17 +875,24 @@ sudo systemctl restart siem-alarm-scoring.timer
 Gunakan waktu UTC dan mulai dari awal bucket:
 
 ```bash
-sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
+sudo systemctl stop siem-alarm-scoring.timer
+read -rsp 'Indexer password: ' WAZUH_PASS; echo
+export WAZUH_PASS
+sudo --preserve-env=WAZUH_PASS -u siem-alarm /usr/bin/python3 -B \
+  /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
   --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
   --once \
   --from 2026-05-22T10:00:00Z \
   --to 2026-05-22T12:00:00Z
+unset WAZUH_PASS
+sudo systemctl start siem-alarm-scoring.timer
 ```
 
 Catatan:
 - Gunakan `--from` pada awal jam/bucket agar count bucket awal tidak parsial.
 - `--from` bersifat inclusive (`>=`) dan `--to` bersifat exclusive (`<`). Contoh di atas memproses `10:00:00Z <= timestamp < 12:00:00Z`.
 - Jangan gunakan `--loop` untuk backfill.
+- Hentikan timer selama backfill agar run calendar tidak bertabrakan; lock tetap menjadi pengaman terakhir.
 - Jika jumlah alert sangat besar dan run berhenti karena `max_alerts_per_run`, naikkan limit sementara atau pecah backfill menjadi window lebih kecil.
 - Backfill historis dapat membuat dokumen `alarm_escalation` lama. Untuk mencegah aplikasi eksternal menganggapnya alert baru, pertimbangkan set sementara `"escalation_log_enabled": false` saat backfill historis, atau pastikan aplikasi eksternal memfilter window waktu yang benar.
 
@@ -815,7 +900,7 @@ Catatan:
 
 - [ ] `/etc/systemd/system/siem-alarm-scoring.service` dibuat.
 - [ ] `/etc/systemd/system/siem-alarm-scoring.timer` dibuat.
-- [ ] `OnUnitActiveSec=5min` sudah terkonfigurasi.
+- [ ] `OnCalendar=*-*-* *:0/5:00` sudah terkonfigurasi.
 - [ ] `systemctl daemon-reload` dijalankan.
 - [ ] Timer di-enable dan di-start.
 - [ ] `systemctl list-timers` menampilkan NEXT run dalam ~5 menit.
@@ -1010,6 +1095,8 @@ sha256("escalation|" + alarm.id + "|" + risk.level)
 
 Satu `alarm.id` + satu `risk.level` hanya menghasilkan satu dokumen `alarm_escalation` per bucket. Jika 5 menit berikutnya level tetap sama, script hanya meng-update `alarm_state` dan tidak membuat log eskalasi baru.
 
+Script memakai endpoint create-only (`PUT <index>/_create/<escalation.id>`) dan memperlakukan HTTP 409 sebagai "sudah ada". Escalation event dibuat **sebelum** state di-update. Jika state write gagal, run berikutnya menemukan escalation ID yang sama lalu mengulangi state write; event tidak hilang dan tidak terduplikasi.
+
 ### 16.4 Contoh query untuk aplikasi eksternal
 
 ```json
@@ -1125,6 +1212,10 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] Membuat log eskalasi untuk setiap update 5 menit (bukan hanya saat eligible/naik level).
 - [ ] Memberi asset value 5 ke semua agent.
 - [ ] Mengetik password indexer langsung di command line.
+- [ ] Menjalankan timer dan manual/backfill bersamaan dengan lock file berbeda.
+- [ ] Menonaktifkan TLS verification untuk production.
+- [ ] Membiarkan runtime meng-install template setiap 5 menit.
+- [ ] Meng-update `alarm_state` sebelum memastikan event eskalasi sudah ada.
 
 ---
 
@@ -1135,13 +1226,18 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] `wazuh-alerts-*` normal dan terisi.
 
 **Persiapan:**
+- [ ] Internal user/role Indexer `siem_alarm_service` dibuat dengan least privilege.
+- [ ] TLS verification berhasil memakai `/opt/wazuh-risk-scoring/root-ca.pem`; tidak ada `-k`/`verify_ssl: false` di production.
+- [ ] `/etc/wazuh-risk-scoring/siem-alarm.env` berisi secret sebenarnya dan permission `0640 root:siem-alarm`.
 - [ ] Audit field sudah dijalankan.
 - [ ] Asset value disiapkan via labels atau `assets.json`.
-- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`, `lookback_overlap_minutes: 7`, `escalation_log_enabled: true`, `max_alerts_per_run: 50000`).
+- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`, `lookback_overlap_minutes: 7`, `escalation_log_enabled: true`, `max_alerts_per_run: 50000`, `install_template: false`).
 - [ ] Index template `siem-alarm-*` sudah dibuat (termasuk mapping field `risk.level_history`).
+- [ ] ISM retention policy sudah dipasang dan umur retensi disetujui pemilik data.
 
 **Validasi script:**
-- [ ] Test syntax: `python3 -m py_compile` berhasil.
+- [ ] Automated unit test lokal berhasil.
+- [ ] `systemd-analyze verify` berhasil pada Ubuntu target.
 - [ ] Run manual `--once` berhasil.
 - [ ] `siem-alarm-*` terbentuk.
 - [ ] `raw_alert_count` tervalidasi.
@@ -1153,6 +1249,7 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] Systemd service dan timer dibuat.
 - [ ] `systemctl list-timers` menampilkan NEXT run dalam ~5 menit.
 - [ ] Timer jalan minimal sekali setelah di-enable.
+- [ ] Tidak ada dua proses scoring bersamaan; lock contention menghasilkan exit gagal yang terlihat.
 
 **Dashboard & log eskalasi:**
 - [ ] Index pattern `siem-alarm-*` dibuat, time field = `timestamp`.
@@ -1160,9 +1257,11 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] Query aplikasi eksternal membaca `document.type = alarm_escalation`.
 - [ ] Dedup log eskalasi via `escalation.id` sudah aktif.
 - [ ] Test eskalasi: pastikan log baru muncul saat level eligible/naik, bukan setiap update 5 menit.
+- [ ] Failure injection: jika state write gagal setelah escalation create, run berikutnya pulih tanpa kehilangan/duplikasi escalation event.
 
 **Operasional:**
 - [ ] Log script dimonitor.
+- [ ] Logrotate berhasil dan journal tidak berisi duplikasi baris ke file yang sama.
 - [ ] Rollback plan disiapkan.
 - [ ] Prosedur manual backfill `--from/--to` dipahami untuk outage panjang.
 - [ ] SOP SOC diperbarui dengan penjelasan progressive alarm.
@@ -1199,17 +1298,27 @@ sudo systemctl list-timers --all | grep siem-alarm
 
 **Step 3 — Hapus index bermasalah:**
 ```bash
-export WAZUH_PASS='PASSWORD_INDEXER'
+sudo curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user admin \
+  'https://127.0.0.1:9200/_cat/indices/siem-alarm-*?v'
 
 # Hapus index tertentu
-curl -k -u admin:"$WAZUH_PASS" -X DELETE \
+sudo curl --fail --silent --show-error \
+  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+  --user admin -X DELETE \
   "https://127.0.0.1:9200/siem-alarm-2026.05.22"
 
-# ATAU hapus semua (hati-hati)
-curl -k -u admin:"$WAZUH_PASS" -X DELETE \
-  "https://127.0.0.1:9200/siem-alarm-*"
-
-unset WAZUH_PASS
+# ATAU hapus semua hanya setelah konfirmasi eksplisit
+read -r -p 'Ketik HAPUS-SEMUA-SIEM-ALARM: ' CONFIRM_DELETE
+if [[ "${CONFIRM_DELETE}" == "HAPUS-SEMUA-SIEM-ALARM" ]]; then
+  sudo curl --fail --silent --show-error \
+    --cacert /opt/wazuh-risk-scoring/root-ca.pem \
+    --user admin -X DELETE \
+    "https://127.0.0.1:9200/siem-alarm-*"
+else
+  echo 'Pembatalan: konfirmasi tidak cocok.'
+fi
 ```
 
 > `wazuh-alerts-*` **TIDAK DISENTUH** dalam rollback apapun.
@@ -1222,15 +1331,13 @@ sudo journalctl -u siem-alarm-scoring.service -n 100 --no-pager
 
 **Step 5 — Perbaiki config/script:**
 ```bash
-sudo nano /opt/wazuh-risk-scoring/config.siem_alarm.json
-sudo nano /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py
+sudoedit /opt/wazuh-risk-scoring/config.siem_alarm.json
+# Perubahan source dilakukan di repository, dites, lalu deploy ulang via installer.
 ```
 
 **Step 6 — Test manual ulang:**
 ```bash
-sudo python3 /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
-  --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
-  --once
+sudo systemctl start siem-alarm-scoring.service
 
 sudo tail -n 50 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
 ```
@@ -1274,4 +1381,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 3.5 — Perubahan dari v3.4: contoh scoring diperbaiki agar sesuai threshold risk level, `alarm_escalation.source.raw_alert_count` dijelaskan sebagai snapshot, manual backfill `--to` didefinisikan exclusive, dan risiko log eskalasi historis saat backfill didokumentasikan.*
+*Versi 4.0 — Hardening production: escalation create-only sebelum state, retry/backoff, validasi failed shard, process lock, strict config/alert validation, TLS/CA, least-privilege service, calendar timer yang benar-benar persistent, journald + logrotate, backup installer, systemd verification, dan ISM retention policy.*
