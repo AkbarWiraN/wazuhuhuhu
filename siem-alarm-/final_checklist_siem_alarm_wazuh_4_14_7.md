@@ -899,7 +899,7 @@ ReadWritePaths=/opt/wazuh-risk-scoring/logs /var/lib/wazuh-risk-scoring
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-RuntimeMaxSec=240s
+TimeoutStartSec=240s
 TimeoutStopSec=20s
 MemoryHigh=512M
 MemoryMax=1G
@@ -914,7 +914,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 ```
 
-`After=wazuh-indexer.service` hanya mengatur urutan bila Indexer sedang dimulai oleh mekanisme lain; unit scorer sengaja tidak me-`Wants` Indexer agar maintenance stop tidak dibatalkan oleh timer. `StateDirectory` memisahkan checkpoint mutable dari application files. `MemoryHigh=512M` memberi pressure lebih awal dan `MemoryMax=1G` menjadi hard stop agar Python tidak menekan heap Indexer pada AIO. `MemorySwapMax=0` mencegah scorer membuat host thrashing. `RuntimeMaxSec=240s` menyisakan waktu sebelum jadwal lima menit berikutnya; bulk/checkpoint yang idempotent membuat run aman diulang bila service dihentikan pada limit. `Nice=5`, `CPUWeight=25`, dan `IOWeight=25` memprioritaskan Wazuh saat ada contention; weight bukan quota sehingga scorer tetap dapat memakai kapasitas idle.
+`After=wazuh-indexer.service` hanya mengatur urutan bila Indexer sedang dimulai oleh mekanisme lain; unit scorer sengaja tidak me-`Wants` Indexer agar maintenance stop tidak dibatalkan oleh timer. `StateDirectory` memisahkan checkpoint mutable dari application files. `MemoryHigh=512M` memberi pressure lebih awal dan `MemoryMax=1G` menjadi hard stop agar Python tidak menekan heap Indexer pada AIO. `MemorySwapMax=0` mencegah scorer membuat host thrashing. `TimeoutStartSec=240s` membatasi eksekusi `Type=oneshot` dan menyisakan waktu sebelum jadwal lima menit berikutnya; bulk/checkpoint yang idempotent membuat run aman diulang bila service dihentikan pada limit. `Nice=5`, `CPUWeight=25`, dan `IOWeight=25` memprioritaskan Wazuh saat ada contention; weight bukan quota sehingga scorer tetap dapat memakai kapasitas idle.
 
 Failure handler berikut juga dibuat installer:
 
@@ -1086,7 +1086,7 @@ if sudo systemd-run --quiet --wait --collect \
     --property=MemorySwapMax=0 \
     --property=CPUWeight=25 \
     --property=IOWeight=25 \
-    --property=RuntimeMaxSec=240s \
+    --property=TimeoutStartSec=240s \
     /usr/bin/python3 -B \
     /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
     --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
@@ -1130,7 +1130,7 @@ Catatan:
 - [ ] Service berhasil jalan minimal sekali.
 - [ ] Log tidak ada error.
 - [ ] Checkpoint `/var/lib/wazuh-risk-scoring/checkpoint.json` dibuat setelah run calendar sukses dan dimiliki `siem-alarm:siem-alarm`.
-- [ ] Run selesai sebelum `RuntimeMaxSec=240s` dan tidak menyentuh `MemoryMax=1G`.
+- [ ] Run selesai sebelum `TimeoutStartSec=240s` dan tidak menyentuh `MemoryMax=1G`.
 - [ ] `raw_alert_count` bertambah antara dua run berturutan (validasi progressive update).
 
 ---

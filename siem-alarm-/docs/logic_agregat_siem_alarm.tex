@@ -1202,8 +1202,8 @@ bukan kapasitas yang dijanjikan. Membagi bucket di tengah setelah cap tercapai a
 menghasilkan frequency salah, sehingga engine menolak pendekatan tersebut.
 
 Process lock berbasis \code{fcntl} mencegah dua instance Linux yang memakai lock file
-sama berjalan bersamaan. Systemd \code{RuntimeMaxSec=240s} membatasi durasi agar run
-tidak bertumpuk dengan jadwal berikutnya.
+sama berjalan bersamaan. Systemd \code{TimeoutStartSec=240s} membatasi eksekusi
+\code{Type=oneshot} agar run tidak bertumpuk dengan jadwal berikutnya.
 
 \chapter{Keamanan dan Least Privilege}
 
@@ -1465,7 +1465,7 @@ Gunakan daftar berikut sebagai keputusan go/no-go:
   \item Current state berkembang dan closed bucket menjadi finalized.
   \item Late-alert SLO berada di bawah finalization delay.
   \item Failure injection membuktikan retry tidak menduplikasi event.
-  \item Load test dua kali peak memenuhi p95 dan RuntimeMaxSec.
+  \item Load test dua kali peak memenuhi p95 dan TimeoutStartSec.
   \item Checkpoint owner/mode benar dan bergerak hanya setelah run sukses.
   \item Dashboard memfilter document type dengan benar.
   \item Monitoring service failure dan prosedur backfill sudah dimiliki operator.

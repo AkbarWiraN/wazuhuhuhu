@@ -272,6 +272,8 @@ class ScoringTests(unittest.TestCase):
         self.assertIn('EXPECTED_FILEBEAT_VERSION="7.10.2"', installer)
         self.assertIn("sys.version_info >= (3, 8)", installer)
         self.assertIn("python3 >= 3.8 is required", installer)
+        self.assertIn("TimeoutStartSec=240s", installer)
+        self.assertNotIn("RuntimeMaxSec=", installer)
         self.assertIn("filebeat test output", installer)
         self.assertIn("final_checklist_siem_alarm_wazuh_4_14_7.md", installer)
         self.assertIn("printf '{}\\n' >\"${BASE_DIR}/assets.json\"", installer)

@@ -453,7 +453,7 @@ sudo /usr/bin/python3 -m json.tool \
 
 Untuk margin aman, ukur end-to-end Filebeat/Indexer lag dan tetapkan SLO internal jauh di bawah eligibility delay, misalnya p99 di bawah 5 menit. Monitor juga:
 
-- durasi run harus jauh di bawah `RuntimeMaxSec=240s`;
+- durasi run harus jauh di bawah `TimeoutStartSec=240s`;
 - tidak ada `429`, timeout, shard failure, cap 100.000 alert/20.000 case, atau `MemoryMax`;
 - checkpoint dan dokumen `alarm_state` terus bergerak;
 - disk/heap/CPU Wazuh tidak memburuk pada jam puncak;
