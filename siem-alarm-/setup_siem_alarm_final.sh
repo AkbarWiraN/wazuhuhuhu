@@ -113,8 +113,8 @@ filebeat test output >/dev/null \
   || die "Filebeat cannot connect securely to the Wazuh Indexer"
 
 PYTHON_VERSION="$(/usr/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-PYTHON_OK="$(/usr/bin/python3 -c 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')"
-[[ "${PYTHON_OK}" == "1" ]] || die "python3 >= 3.9 is required. Found ${PYTHON_VERSION}."
+PYTHON_OK="$(/usr/bin/python3 -c 'import sys; print(1 if sys.version_info >= (3, 8) else 0)')"
+[[ "${PYTHON_OK}" == "1" ]] || die "python3 >= 3.8 is required. Found ${PYTHON_VERSION}."
 
 echo "[+] Pre-validating source files"
 /usr/bin/python3 -m json.tool "${SCRIPT_DIR}/config.siem_alarm.example.json" >/dev/null

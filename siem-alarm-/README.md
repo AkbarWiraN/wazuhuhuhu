@@ -2,7 +2,7 @@
 
 Proyek ini mengubah banyak raw alert Wazuh menjadi alarm SOC per `agent.id + rule.id + bucket 1 jam`. Raw evidence `wazuh-alerts-*` hanya dibaca; state alarm dan event eskalasi ditulis ke `siem-alarm-*`.
 
-Baseline yang didukung dan dipaksa oleh installer adalah Ubuntu single-node/all-in-one dengan `wazuh-manager`, `wazuh-indexer`, dan `wazuh-dashboard` **4.14.7**, serta Filebeat OSS **7.10.2**. Deployment distributed, versi patch lain, container, atau Wazuh Cloud memerlukan review tersendiri.
+Baseline yang didukung dan dipaksa oleh installer adalah Ubuntu single-node/all-in-one dengan `wazuh-manager`, `wazuh-indexer`, dan `wazuh-dashboard` **4.14.7**, Filebeat OSS **7.10.2**, serta Python **3.8 atau lebih baru**. Baseline Python 3.8 dipertahankan agar Ubuntu 20.04 dapat memakai interpreter sistem tanpa mengganti symlink `/usr/bin/python3` atau menambah PPA. Deployment distributed, versi patch lain, container, atau Wazuh Cloud memerlukan review tersendiri.
 
 ## Status audit
 

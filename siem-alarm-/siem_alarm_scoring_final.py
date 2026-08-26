@@ -18,7 +18,7 @@ Core design:
 - source.raw_alert_count == alarm.event_count == risk.frequency_count_1h.
 
 Dependencies:
-- Python 3.9+ standard library only.
+- Python 3.8+ standard library only.
 - Linux fcntl process locking.
 
 Example:
@@ -139,7 +139,7 @@ def parse_dt(value: Any) -> Optional[dt.datetime]:
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         # Wazuh's native alert timestamp commonly uses ±HHMM (for example
-        # +0000 or +0300). Normalize it for consistent Python 3.9+ parsing.
+        # +0000 or +0300). Normalize it for consistent Python 3.8+ parsing.
         text = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", text)
         parsed = dt.datetime.fromisoformat(text)
         if parsed.tzinfo is None or parsed.utcoffset() is None:

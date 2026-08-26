@@ -8,6 +8,7 @@
 ## 0. Keputusan Desain Final
 
 - Wazuh 4.14.7 berjalan **single node / all-in-one** di Ubuntu VM.
+- Python sistem minimal 3.8; Ubuntu 20.04 dapat memakai `/usr/bin/python3` bawaan tanpa mengganti symlink atau menambah PPA.
 - `wazuh-alerts-*` **tetap dipertahankan** sebagai raw evidence.
 - `siem-alarm-*` adalah index baru untuk **alarm agregasi SOC**, bukan copy mentah.
 - Default deduplication key:

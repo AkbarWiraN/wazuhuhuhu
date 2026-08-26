@@ -270,6 +270,8 @@ class ScoringTests(unittest.TestCase):
         installer = (ROOT / "setup_siem_alarm_final.sh").read_text(encoding="utf-8")
         self.assertIn('EXPECTED_WAZUH_VERSION="4.14.7"', installer)
         self.assertIn('EXPECTED_FILEBEAT_VERSION="7.10.2"', installer)
+        self.assertIn("sys.version_info >= (3, 8)", installer)
+        self.assertIn("python3 >= 3.8 is required", installer)
         self.assertIn("filebeat test output", installer)
         self.assertIn("final_checklist_siem_alarm_wazuh_4_14_7.md", installer)
         self.assertIn("printf '{}\\n' >\"${BASE_DIR}/assets.json\"", installer)
