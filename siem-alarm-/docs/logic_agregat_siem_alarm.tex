@@ -1200,6 +1200,11 @@ dapat membuat count salah. Contohnya:
 Default cap 100.000 raw alert dan 20.000 case per bucket adalah ceiling keselamatan,
 bukan kapasitas yang dijanjikan. Membagi bucket di tengah setelah cap tercapai akan
 menghasilkan frequency salah, sehingga engine menolak pendekatan tersebut.
+Initial scroll menggunakan \code{track\_total\_hits=true} karena Wazuh Indexer
+4.14.7 menolak threshold numerik pada scroll context. Indexer karena itu menghitung
+total hit eksak sebelum cap diperiksa. Cap tetap mencegah pagination, agregasi,
+bulk, dan checkpoint untuk bucket yang terlalu besar, tetapi biaya exact-hit count
+tetap harus diukur dalam load test.
 
 Process lock berbasis \code{fcntl} mencegah dua instance Linux yang memakai lock file
 sama berjalan bersamaan. Systemd \code{TimeoutStartSec=240s} membatasi eksekusi
@@ -1220,7 +1225,7 @@ Role runtime yang disarankan:
 \toprule
 \textbf{Scope} & \textbf{Pattern} & \textbf{Hak}\\
 \midrule
-Cluster & -- & \code{cluster\_composite\_ops\_ro} dan envelope bulk yang dibutuhkan.\\
+Cluster & -- & \code{cluster\_composite\_ops\_ro}, clear-scroll, dan envelope bulk yang dibutuhkan.\\
 Source & \code{wazuh-alerts-*} & Read-only.\\
 Destination & \code{siem-alarm-*} & Read, index, dan create-index.\\
 Tenant & -- & Tidak diperlukan.\\

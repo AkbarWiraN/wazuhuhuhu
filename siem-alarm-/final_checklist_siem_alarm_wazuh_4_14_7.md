@@ -1,6 +1,6 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.7 AIO
 
-> **Versi 5.1** — Wazuh 4.14.7 compatibility + Production-hardened Snapshot-Bulk V2
+> **Versi 5.2** — Wazuh 4.14.7 compatibility + Production-hardened Snapshot-Bulk V2
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
@@ -498,26 +498,32 @@ Sebelum test, buka **Indexer Management → Security** sebagai administrator:
 
 1. Pada **Internal users**, buat user `siem_alarm_service` dengan password unik.
 2. Pada **Roles**, buat role `siem_alarm_runtime` dengan:
-   - Cluster permissions: `cluster_composite_ops_ro`—dibutuhkan untuk `_mget` serta operasi scroll/clear-scroll.
+   - Cluster permissions: `cluster_composite_ops_ro`—dibutuhkan untuk `_mget` serta operasi scroll.
+   - Cluster permission individual: `indices:data/read/scroll/clear`—dibutuhkan untuk menutup scroll context; action group bawaan `cluster_composite_ops_ro` hanya memuat operasi scroll, bukan clear-scroll.
    - Cluster permission individual: `indices:data/write/bulk*`—Bulk API dievaluasi juga pada scope cluster.
    - Index pattern `wazuh-alerts-*`: allowed action `read`.
    - Index pattern `siem-alarm-*`: allowed actions `read`, `index`, dan `create_index`.
    - Tenant permissions: kosong.
 3. Pada tab **Mapped users** role tersebut, map `siem_alarm_service`.
 
-Hak `read` pada `siem-alarm-*` diperlukan karena engine membaca state lama melalui endpoint per-index `_mget`. Action group index `index` mencakup operasi index/create di dalam bulk, sedangkan permission cluster individual `indices:data/write/bulk*` mengizinkan envelope Bulk API walaupun endpoint-nya per-index. Request dikelompokkan per destination index dan tidak memakai global `/_mget`/`/_bulk` dengan `_index` eksplisit, sehingga tetap kompatibel dengan cluster yang menonaktifkan `rest.action.multi.allow_explicit_index`. Jangan menggantinya dengan `cluster_composite_ops`, karena action group tersebut juga memberi reindex dan pengelolaan alias yang tidak diperlukan. Jangan memberikan `indices_all`, akses Security API, system index, atau index Wazuh lain. Template dan ISM policy dipasang satu kali menggunakan administrator; runtime account tidak memerlukan cluster-admin.
+Hak `read` pada `siem-alarm-*` diperlukan karena engine membaca state lama melalui endpoint per-index `_mget`. Action group `read` pada source mencakup clear-scroll pada scope index, sementara permission individual `indices:data/read/scroll/clear` melengkapinya pada scope cluster. Action group index `index` mencakup operasi index/create di dalam bulk, sedangkan permission cluster individual `indices:data/write/bulk*` mengizinkan envelope Bulk API walaupun endpoint-nya per-index. Request dikelompokkan per destination index dan tidak memakai global `/_mget`/`/_bulk` dengan `_index` eksplisit, sehingga tetap kompatibel dengan cluster yang menonaktifkan `rest.action.multi.allow_explicit_index`. Jangan menggantinya dengan `cluster_composite_ops`, karena action group tersebut juga memberi reindex dan pengelolaan alias yang tidak diperlukan. Jangan memberikan `indices_all`, akses Security API, system index, atau index Wazuh lain. Template dan ISM policy dipasang satu kali menggunakan administrator; runtime account tidak memerlukan cluster-admin.
 
 Rujukan permission: [OpenSearch default action groups](https://docs.opensearch.org/latest/security/access-control/default-action-groups/) dan [Bulk API required permissions](https://docs.opensearch.org/latest/api-reference/document-apis/bulk/). Tetap lakukan preflight dengan user production pada Indexer 4.14.7; respons bulk harus diperiksa per item, bukan hanya HTTP status.
 
 Gunakan input password interaktif dan verifikasi CA. Jangan memasukkan password ke argumen command.
 
 ```bash
+ALERT_INDEX_DATE="$(date -u +%Y.%m.%d)"
 sudo curl --fail --silent --show-error \
   --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user siem_alarm_service \
-  https://127.0.0.1:9200
+  "https://127.0.0.1:9200/wazuh-alerts-4.x-${ALERT_INDEX_DATE}/_count?pretty"
 ```
+
+Respons harus HTTP `200`. Endpoint akar `GET /` dapat menghasilkan `403` karena
+role runtime sengaja tidak memiliki `cluster:monitor/main`; ini bukan kegagalan
+autentikasi dan permission tersebut tidak perlu ditambahkan.
 
 > Jika certificate SAN tidak memuat `127.0.0.1`, ganti URL dengan hostname/IP yang tercantum pada sertifikat. Jangan kembali memakai `-k` di production.
 
@@ -1022,6 +1028,13 @@ sudo journalctl -t siem-alarm-scoring -n 100 --no-pager
 sudo tail -n 100 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
 ```
 
+Jika initial scroll menghasilkan HTTP `400` dengan pesan `disabling
+[track_total_hits] is not allowed in a scroll context`, scorer yang terpasang
+masih memakai threshold numerik yang tidak kompatibel dengan Wazuh Indexer
+4.14.7/OpenSearch 2.19. Upgrade ke source proyek terkini yang mengirim
+`track_total_hits=true`; kegagalan ini terjadi sebelum pagination, bulk, dan
+checkpoint, sehingga jangan menghapus index atau checkpoint sebagai respons.
+
 **Cek python path:**
 ```bash
 test -x /usr/bin/python3 && /usr/bin/python3 --version
@@ -1424,6 +1437,12 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 
 `max_alerts_per_bucket=100000` dan `max_cases_per_bucket=20000` adalah fail-safe ceiling, **bukan** jaminan bahwa VM mampu memproses batas itu dalam 240 detik. Batas case mencegah mode dedup/cardinality ekstrem memenuhi RAM sebelum bulk. Kapasitas aktual ditentukan alert per bucket, jumlah case unik, cardinality evidence, heap/disk Indexer, dan ukuran dokumen hasil.
 
+Initial search pada scroll memakai `track_total_hits=true`. Wazuh Indexer 4.14.7
+menolak threshold numerik `track_total_hits` pada scroll context, sehingga total hit
+harus dihitung eksak sebelum cap diperiksa. Cap tetap menghentikan bucket sebelum
+pagination, agregasi, bulk, dan checkpoint, tetapi biaya exact-hit count tetap terjadi
+dan harus masuk pengukuran load test.
+
 Dengan `A` raw alert, `C` case unik, page/mget/bulk 1.000, jumlah request normal kira-kira:
 
 ```text
@@ -1472,7 +1491,7 @@ Jangan menambah worker paralel pada AIO. Batch berjalan serial dan bounded agar 
 - [ ] `wazuh-alerts-*` normal dan terisi.
 
 **Persiapan:**
-- [ ] Internal user/role Indexer `siem_alarm_service` memakai cluster `cluster_composite_ops_ro` + `indices:data/write/bulk*`, source `read`, destination `read,index,create_index`, tanpa permission lebih luas.
+- [ ] Internal user/role Indexer `siem_alarm_service` memakai cluster `cluster_composite_ops_ro` + `indices:data/read/scroll/clear` + `indices:data/write/bulk*`, source `read`, destination `read,index,create_index`, tanpa permission lebih luas.
 - [ ] TLS verification berhasil memakai `/opt/wazuh-risk-scoring/root-ca.pem`; tidak ada `-k`/`verify_ssl: false` di production.
 - [ ] `/etc/wazuh-risk-scoring/siem-alarm.env` berisi secret sebenarnya dan permission `0640 root:siem-alarm`.
 - [ ] Audit field sudah dijalankan.
@@ -1623,4 +1642,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 5.1 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, exact daily source index, source filtering, Snapshot-Bulk V2 (`_mget` + two-phase `_bulk`), asset inventory tervalidasi, cardinality/checkpoint/catch-up bounded, least-privilege bulk permission, resource-capped systemd, OnFailure journal handler, TLS mandatory, deterministic escalation/state, backup installer, template, dan ISM retention.*
+*Versi 5.2 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, exact daily source index, scroll-compatible exact hit tracking, source filtering, Snapshot-Bulk V2 (`_mget` + two-phase `_bulk`), asset inventory tervalidasi, cardinality/checkpoint/catch-up bounded, least-privilege bulk permission, resource-capped systemd, OnFailure journal handler, TLS mandatory, deterministic escalation/state, backup installer, template, dan ISM retention.*

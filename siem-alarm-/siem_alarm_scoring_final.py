@@ -350,7 +350,7 @@ class OpenSearchClient:
         try:
             self.request("DELETE", "_search/scroll", {"scroll_id": [scroll_id]}, attempts=1)
         except Exception as exc:
-            logging.debug("clear_scroll failed: %s", exc)
+            logging.warning("clear_scroll failed; context will expire server-side: %s", exc)
 
     def mget(self, index: str, ids: List[str]) -> Dict[str, Any]:
         return self.request(
@@ -891,9 +891,10 @@ def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte
         "size": int(config.get("page_size", 1000)),
         "query": build_query(config, gte, lte, upper_inclusive),
         "sort": ["_doc"],
-        # Exact below the guard, early lower-bound once the guard is exceeded.
-        # This avoids counting millions of matches merely to reject the bucket.
-        "track_total_hits": max_alerts + 1 if max_alerts > 0 else True,
+        # OpenSearch requires exact hit tracking in a scroll context. Numeric
+        # thresholds are treated as disabling exact tracking and Wazuh Indexer
+        # 4.14.7 rejects the request before the first page is returned.
+        "track_total_hits": True,
         "timeout": f"{max(1, request_timeout - 5)}s",
         "_source": {"includes": configured_source_includes(config)},
     }

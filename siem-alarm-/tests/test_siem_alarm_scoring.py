@@ -609,7 +609,7 @@ class ScoringTests(unittest.TestCase):
         source_index, body, params = client.search_calls[0]
         self.assertEqual(source_index, "wazuh-alerts-4.x-2026.05.22")
         self.assertEqual(body["sort"], ["_doc"])
-        self.assertEqual(body["track_total_hits"], config["max_alerts_per_bucket"] + 1)
+        self.assertIs(body["track_total_hits"], True)
         self.assertEqual(body["timeout"], "55s")
         self.assertEqual(body["size"], 2)
         includes = body["_source"]["includes"]
@@ -631,7 +631,6 @@ class ScoringTests(unittest.TestCase):
 
     def test_fetch_alerts_rejects_cap_before_pagination(self) -> None:
         capped_response = search_response([search_hit("0", alert(0))], 4, "scroll-cap")
-        capped_response["hits"]["total"]["relation"] = "gte"
         client = RecordingSearchClient([capped_response])
         config = base_config()
         config["max_alerts_per_bucket"] = 3
@@ -649,6 +648,27 @@ class ScoringTests(unittest.TestCase):
 
         self.assertEqual(client.scroll_calls, [])
         self.assertEqual(client.clear_calls, ["scroll-cap"])
+
+    def test_fetch_alerts_rejects_non_exact_total(self) -> None:
+        non_exact_response = search_response([search_hit("0", alert(0))], 3, "scroll-gte")
+        non_exact_response["hits"]["total"]["relation"] = "gte"
+        client = RecordingSearchClient([non_exact_response])
+        config = base_config()
+        config["max_alerts_per_bucket"] = 3
+
+        with self.assertRaisesRegex(RuntimeError, "did not return an exact hit total"):
+            list(
+                scoring.fetch_alerts(
+                    client,
+                    config,
+                    "2026-05-22T10:00:00Z",
+                    "2026-05-22T11:00:00Z",
+                    False,
+                )
+            )
+
+        self.assertEqual(client.scroll_calls, [])
+        self.assertEqual(client.clear_calls, ["scroll-gte"])
 
     def test_fetch_alerts_rejects_missing_continuation_cursor(self) -> None:
         client = RecordingSearchClient(

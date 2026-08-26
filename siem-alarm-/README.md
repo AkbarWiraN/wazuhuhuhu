@@ -125,23 +125,32 @@ Masuk ke Wazuh Dashboard sebagai administrator, lalu buka **Indexer Management �
 
 1. Buat internal user `siem_alarm_service` dengan password unik.
 2. Buat role `siem_alarm_runtime`.
-3. Isi cluster permissions dengan `cluster_composite_ops_ro` dan permission individual `indices:data/write/bulk*`.
+3. Isi cluster permissions dengan `cluster_composite_ops_ro` serta permission individual `indices:data/read/scroll/clear` dan `indices:data/write/bulk*`.
 4. Untuk index pattern `wazuh-alerts-*`, beri action group `read`.
 5. Untuk index pattern `siem-alarm-*`, beri `read`, `index`, dan `create_index`.
 6. Kosongkan tenant permissions, lalu map user `siem_alarm_service` ke role tersebut.
 
 Jangan memberi `cluster_composite_ops`, `indices_all`, Security API, template, ISM, atau akses index Wazuh lain kepada runtime user.
 
-Uji autentikasi. `--user siem_alarm_service` meminta password secara interaktif:
+Uji TLS, autentikasi, mapping role, dan hak baca pada exact daily source index.
+`--user siem_alarm_service` meminta password secara interaktif:
 
 ```bash
 : "${SIEM_INDEXER_URL:?export SIEM_INDEXER_URL terlebih dahulu}"
+SIEM_ALERT_INDEX_DATE="$(date -u +%Y.%m.%d)"
 sudo curl --fail --silent --show-error \
   --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user siem_alarm_service \
-  "${SIEM_INDEXER_URL}"
+  "${SIEM_INDEXER_URL}/wazuh-alerts-4.x-${SIEM_ALERT_INDEX_DATE}/_count?pretty"
 ```
+
+Respons harus HTTP `200`. Endpoint akar `GET /` dapat menghasilkan `403` untuk
+role least-privilege ini karena runtime sengaja tidak diberi
+`cluster:monitor/main`; jangan menambah permission tersebut hanya agar endpoint
+akar menjadi `200`. Permission individual `indices:data/read/scroll/clear`
+diperlukan pada scope cluster untuk menutup scroll context; action group `read`
+pada source index sudah memenuhinya pada scope index.
 
 ## 5. Simpan secret runtime
 
@@ -491,6 +500,12 @@ Perubahan bucket, source/filter, dedup/rule override, atau destination prefix me
 ## Batas klaim “siap production”
 
 Untuk 5–25 agent, jumlah agent sendiri kecil. Risiko kapasitas ditentukan EPS, burst, jumlah rule/case unik, dan cardinality evidence. Model steady-state timer 5 menit membaca sekitar `6,5 × A` raw alert per jam untuk laju `A` per bucket: current bucket dihitung ulang, lalu closed bucket difinalisasi sekali. `_mget`/bulk mengurangi request per case, tetapi tidak menghilangkan biaya scan snapshot.
+
+Initial scroll memakai `track_total_hits=true` karena Wazuh Indexer 4.14.7
+menolak threshold numerik pada scroll context. Karena itu Indexer menghitung total hit
+eksak sebelum engine memeriksa `max_alerts_per_bucket`; cap tetap mencegah pagination,
+agregasi, dan penulisan bucket yang terlalu besar, tetapi tidak menghilangkan biaya
+exact-hit count. Masukkan biaya ini dalam shadow/load test.
 
 Proyek dinyatakan **siap untuk staging production**, bukan otomatis terbukti kapasitasnya pada VM Anda. Go-live memerlukan shadow/load test pada traffic puncak, observasi beberapa bucket, dan rollback window. Jangan menaikkan cap, batch, paralelisme, atau cgroup limit sebelum ada hasil ukur.
 
