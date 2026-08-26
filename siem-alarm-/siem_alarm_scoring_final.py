@@ -237,6 +237,22 @@ class OpenSearchHTTPError(RuntimeError):
         super().__init__(f"OpenSearch HTTP {status} {method} {url}: {body}")
 
 
+def is_exact_index_not_found_error(error: Any, expected_index: str) -> bool:
+    return (
+        isinstance(error, dict)
+        and error.get("type") == "index_not_found_exception"
+        and error.get("index") == expected_index
+    )
+
+
+def http_error_payload(body: str) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 class OpenSearchClient:
     RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
 
@@ -1341,6 +1357,8 @@ def load_existing_states(
         by_index[index].append(doc_id)
 
     for index in sorted(by_index):
+        observed_missing_index = False
+        observed_present_index = False
         for id_batch in chunked(by_index[index], batch_size):
             pending_ids = list(id_batch)
             for attempt in range(1, retry_attempts + 1):
@@ -1349,9 +1367,22 @@ def load_existing_states(
                 try:
                     response = client.mget(index, pending_ids)
                 except OpenSearchHTTPError as exc:
-                    if exc.status == 404 and "index_not_found_exception" in exc.body:
+                    payload = http_error_payload(exc.body)
+                    error = payload.get("error") if payload else None
+                    if exc.status == 404 and is_exact_index_not_found_error(error, index):
+                        if observed_present_index:
+                            raise RuntimeError(
+                                f"Destination index={index} disappeared during _mget; aborting"
+                            ) from exc
+                        observed_missing_index = True
                         for key in batch:
                             states[key] = None
+                        logging.info(
+                            "Destination index %s does not exist yet; bootstrapping %d new "
+                            "aggregate state(s) (normal on first nonempty run or UTC day rollover)",
+                            index,
+                            len(batch),
+                        )
                         pending_ids = []
                         break
                     raise
@@ -1362,7 +1393,8 @@ def load_existing_states(
                         f"{len(returned) if isinstance(returned, list) else 'non-array'}"
                     )
                 seen = set()
-                retry_ids: List[str] = []
+                response_items: List[Tuple[Tuple[str, str], Dict[str, Any]]] = []
+                missing_index_keys = set()
                 for item in returned:
                     if not isinstance(item, dict):
                         raise RuntimeError("Malformed _mget response item")
@@ -1370,13 +1402,58 @@ def load_existing_states(
                     if key not in requested or key in seen:
                         raise RuntimeError(f"Unexpected or duplicate _mget response item: {key}")
                     seen.add(key)
+                    response_items.append((key, item))
+                    error = item.get("error")
+                    status_is_compatible = (
+                        "status" not in item
+                        or (type(item.get("status")) is int and item.get("status") == 404)
+                    )
+                    error_only_item = "found" not in item and "_source" not in item
+                    if (
+                        is_exact_index_not_found_error(error, index)
+                        and status_is_compatible
+                        and error_only_item
+                    ):
+                        missing_index_keys.add(key)
+                if seen != requested:
+                    raise RuntimeError(f"_mget omitted {len(requested - seen)} requested document(s)")
+
+                # Wazuh Indexer may report a missing target index as one error
+                # object per requested document without a per-item HTTP status.
+                # Every ID in this request targets the same daily index, so an
+                # all-item index_not_found response is the normal first-run/day-
+                # rollover case. A mixed response would imply a race or malformed
+                # response and must remain fail-closed.
+                if missing_index_keys:
+                    if missing_index_keys != requested or observed_present_index:
+                        raise RuntimeError(
+                            f"Inconsistent _mget response for missing index={index}: "
+                            f"{len(missing_index_keys)}/{len(requested)} items reported "
+                            "index_not_found_exception"
+                        )
+                    observed_missing_index = True
+                    for key in requested:
+                        states[key] = None
+                    logging.info(
+                        "Destination index %s does not exist yet; bootstrapping %d new "
+                        "aggregate state(s) (normal on first nonempty run or UTC day rollover)",
+                        index,
+                        len(requested),
+                    )
+                    pending_ids = []
+                    break
+
+                if observed_missing_index:
+                    raise RuntimeError(
+                        f"Destination index={index} appeared during _mget; aborting"
+                    )
+                observed_present_index = True
+
+                retry_ids: List[str] = []
+                for key, item in response_items:
                     error = item.get("error")
                     if error:
                         status = to_int(item.get("status"), 0)
-                        error_type = error.get("type") if isinstance(error, dict) else None
-                        if status == 404 and error_type == "index_not_found_exception":
-                            states[key] = None
-                            continue
                         if status in BULK_RETRYABLE_STATUSES and attempt < retry_attempts:
                             retry_ids.append(key[1])
                             continue
@@ -1387,8 +1464,6 @@ def load_existing_states(
                     if item.get("found") is not True or not isinstance(item.get("_source"), dict):
                         raise RuntimeError(f"Malformed _mget document for index={key[0]} id={key[1]}")
                     states[key] = item["_source"]
-                if seen != requested:
-                    raise RuntimeError(f"_mget omitted {len(requested - seen)} requested document(s)")
                 if not retry_ids:
                     pending_ids = []
                     break

@@ -28,7 +28,7 @@ Engine memakai exact daily source index, `_source` allowlist, scroll serial, `_m
 | `siem_alarm_ism_policy.json` | Retensi default 90 hari | Dipasang satu kali oleh admin Indexer |
 | `final_checklist_siem_alarm_wazuh_4_14_7.md` | Runbook rinci, tuning, backfill, dashboard, dan rollback | Referensi operator |
 | `contoh.json` | Contoh raw alert dan dokumen hasil | Tidak dipakai runtime |
-| `docs/logic_agregat_siem_alarm.pdf` | Dokumen 49 halaman: topologi, flowchart, perhitungan, dummy raw Wazuh, state, dan escalation | Referensi arsitektur/SOC |
+| `docs/logic_agregat_siem_alarm.pdf` | Dokumen 50 halaman: topologi, flowchart, perhitungan, dummy raw Wazuh, state, dan escalation | Referensi arsitektur/SOC |
 | `docs/logic_agregat_siem_alarm.tex` | Source XeLaTeX untuk membangun ulang PDF | Tidak dipakai runtime |
 | `docs/examples/dummy_wazuh_alerts_rule_5710.json` | Sepuluh raw alert sintetis dalam format representatif `wazuh-alerts-*` untuk rule default SSHD 5710 | Fixture dokumentasi |
 | `docs/examples/dummy_aggregation_result_rule_5710.json` | Hasil state dan escalation yang dihitung engine dari fixture rule 5710 | Fixture dokumentasi |
@@ -438,6 +438,10 @@ Setiap agent yang diinventaris harus menunjukkan `asset.source=assets_json` dan 
 `alarm.status=open` berarti bucket masih berjalan; `finalized` berarti snapshot bucket tertutup selesai. Field ini bukan acknowledge/resolve workflow analyst.
 
 Jika belum ada alert pada window, run dapat sukses tanpa membuat destination index. Tunggu atau hasilkan alert uji yang aman dan ulangi; jangan aktifkan timer tanpa memverifikasi minimal satu dokumen aktual.
+
+Pada run non-kosong pertama dan pergantian tanggal UTC, daily destination mungkin belum ada. Wazuh Indexer/OpenSearch 2.19 dapat menjawab `_mget` dengan HTTP 200 tetapi memberi `error.type=index_not_found_exception` pada setiap elemen tanpa field `status`. Engine menerima kondisi ini hanya bila **semua** item batch menunjuk concrete destination index yang sama persis, menganggap seluruh state masih baru, lalu membiarkan two-phase bulk pertama membuat index melalui template yang sudah terpasang. Respons campuran, index yang tidak cocok, status yang bertentangan, atau tipe error lain tetap fail-closed. Flip ada/hilang pada retry batch yang sama juga ditolak; penghapusan eksternal di antara batch tetap operasi yang tidak didukung dan tidak dapat dibuat atomik oleh API ini.
+
+Pesan INFO `Destination index ... does not exist yet` normal sekali pada bootstrap/day rollover. Jika muncul untuk daily index yang sebelumnya sudah berisi data, curigai penghapusan di luar prosedur: hentikan timer dan lakukan audit/controlled backfill. Jangan sekadar restart dengan checkpoint lama karena index dapat dibuat kembali tetapi history bucket yang telah lewat tetap hilang.
 
 ## 11. Aktifkan timer
 

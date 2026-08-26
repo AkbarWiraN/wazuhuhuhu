@@ -155,14 +155,14 @@ class RecordingBulkClient:
             key = (index, doc_id)
             if key in self.mget_errors:
                 status, error = self.mget_errors[key]
-                response.append(
-                    {
-                        "_index": key[0],
-                        "_id": key[1],
-                        "status": status,
-                        "error": error,
-                    }
-                )
+                item = {
+                    "_index": key[0],
+                    "_id": key[1],
+                    "error": error,
+                }
+                if status is not None:
+                    item["status"] = status
+                response.append(item)
             elif key in self.states:
                 response.append(
                     {
@@ -219,6 +219,45 @@ class RecordingBulkClient:
 
     def create_doc_if_absent(self, *args, **kwargs):
         raise AssertionError("V2 must use _bulk create, not individual create requests")
+
+
+class BootstrapBulkClient(RecordingBulkClient):
+    """Model the real first-write lifecycle of an auto-created daily index."""
+
+    def __init__(self):
+        super().__init__()
+        self.destination_exists = False
+
+    def mget(self, index, ids):
+        if self.destination_exists:
+            return super().mget(index, ids)
+        self.mget_calls.append((index, list(ids)))
+        return {
+            "docs": [
+                {
+                    "_index": index,
+                    "_id": doc_id,
+                    "error": {
+                        "root_cause": [
+                            {
+                                "type": "index_not_found_exception",
+                                "reason": f"no such index [{index}]",
+                                "index": index,
+                            }
+                        ],
+                        "type": "index_not_found_exception",
+                        "reason": f"no such index [{index}]",
+                        "index": index,
+                    },
+                }
+                for doc_id in reversed(ids)
+            ]
+        }
+
+    def bulk(self, index, payload):
+        response = super().bulk(index, payload)
+        self.destination_exists = True
+        return response
 
 
 def aggregate_cases(rule_ids, config=None, count_per_rule=3):
@@ -799,6 +838,199 @@ class ScoringTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "_mget failed"):
             scoring.load_existing_states(client, [reference], base_config())
         self.assertEqual(client.bulk_calls, [])
+
+    def test_mget_missing_destination_without_item_status_bootstraps_new_states(self) -> None:
+        references = [
+            ("siem-alarm-2026.05.22", "doc-new-1"),
+            ("siem-alarm-2026.05.22", "doc-new-2"),
+        ]
+        missing_index_error = {
+            "root_cause": [
+                {
+                    "type": "index_not_found_exception",
+                    "reason": "no such index [siem-alarm-2026.05.22]",
+                    "index": "siem-alarm-2026.05.22",
+                }
+            ],
+            "type": "index_not_found_exception",
+            "reason": "no such index [siem-alarm-2026.05.22]",
+            "index": "siem-alarm-2026.05.22",
+        }
+        client = RecordingBulkClient(
+            mget_errors={reference: (None, missing_index_error) for reference in references}
+        )
+
+        loaded = scoring.load_existing_states(client, references, base_config())
+
+        self.assertEqual(loaded, {reference: None for reference in references})
+        self.assertEqual(client.bulk_calls, [])
+
+    def test_mget_mixed_missing_index_response_fails_closed(self) -> None:
+        references = [
+            ("siem-alarm-2026.05.22", "doc-new"),
+            ("siem-alarm-2026.05.22", "doc-present"),
+        ]
+        client = RecordingBulkClient(
+            states={references[1]: {"risk": {"level": "Low"}}},
+            mget_errors={
+                references[0]: (
+                    None,
+                    {
+                        "type": "index_not_found_exception",
+                        "reason": "no such index [siem-alarm-2026.05.22]",
+                        "index": "siem-alarm-2026.05.22",
+                    },
+                )
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Inconsistent _mget response"):
+            scoring.load_existing_states(client, references, base_config())
+        self.assertEqual(client.bulk_calls, [])
+
+    def test_mget_missing_destination_accepts_explicit_404_item_status(self) -> None:
+        reference = ("siem-alarm-2026.05.22", "doc-new")
+        client = RecordingBulkClient(
+            mget_errors={
+                reference: (
+                    404,
+                    {
+                        "type": "index_not_found_exception",
+                        "reason": "no such index [siem-alarm-2026.05.22]",
+                        "index": "siem-alarm-2026.05.22",
+                    },
+                )
+            }
+        )
+
+        loaded = scoring.load_existing_states(client, [reference], base_config())
+
+        self.assertIsNone(loaded[reference])
+
+    def test_mget_missing_destination_with_wrong_index_fails_closed(self) -> None:
+        reference = ("siem-alarm-2026.05.22", "doc-new")
+        client = RecordingBulkClient(
+            mget_errors={
+                reference: (
+                    None,
+                    {
+                        "type": "index_not_found_exception",
+                        "reason": "no such index [siem-alarm-wrong]",
+                        "index": "siem-alarm-wrong",
+                    },
+                )
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "_mget failed"):
+            scoring.load_existing_states(client, [reference], base_config())
+
+    def test_mget_missing_destination_with_contradictory_status_fails_closed(self) -> None:
+        reference = ("siem-alarm-2026.05.22", "doc-new")
+        client = RecordingBulkClient(
+            mget_errors={
+                reference: (
+                    503,
+                    {
+                        "type": "index_not_found_exception",
+                        "reason": "no such index [siem-alarm-2026.05.22]",
+                        "index": "siem-alarm-2026.05.22",
+                    },
+                )
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "_mget failed"):
+            scoring.load_existing_states(client, [reference], base_config())
+
+    def test_mget_missing_destination_with_document_fields_fails_closed(self) -> None:
+        reference = ("siem-alarm-2026.05.22", "doc-new")
+        client = mock.Mock()
+        client.mget.return_value = {
+            "docs": [
+                {
+                    "_index": reference[0],
+                    "_id": reference[1],
+                    "found": True,
+                    "_source": {"risk": {"level": "Low"}},
+                    "error": {
+                        "type": "index_not_found_exception",
+                        "reason": "no such index [siem-alarm-2026.05.22]",
+                        "index": "siem-alarm-2026.05.22",
+                    },
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "_mget failed"):
+            scoring.load_existing_states(client, [reference], base_config())
+
+    def test_mget_no_status_non_index_error_fails_closed(self) -> None:
+        reference = ("siem-alarm-2026.05.22", "doc-error")
+        client = RecordingBulkClient(
+            mget_errors={
+                reference: (None, {"type": "unavailable_shards_exception", "reason": "test"})
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "_mget failed"):
+            scoring.load_existing_states(client, [reference], base_config())
+
+    def test_mget_exact_top_level_404_bootstraps_but_text_error_fails(self) -> None:
+        reference = ("siem-alarm-2026.05.22", "doc-new")
+        exact_client = mock.Mock()
+        exact_client.mget.side_effect = scoring.OpenSearchHTTPError(
+            404,
+            "POST",
+            "https://127.0.0.1:9200/siem-alarm-2026.05.22/_mget",
+            json.dumps(
+                {
+                    "error": {
+                        "type": "index_not_found_exception",
+                        "reason": "no such index [siem-alarm-2026.05.22]",
+                        "index": "siem-alarm-2026.05.22",
+                    },
+                    "status": 404,
+                }
+            ),
+        )
+
+        loaded = scoring.load_existing_states(exact_client, [reference], base_config())
+
+        self.assertIsNone(loaded[reference])
+
+        text_client = mock.Mock()
+        text_error = scoring.OpenSearchHTTPError(
+            404,
+            "POST",
+            "https://127.0.0.1:9200/siem-alarm-2026.05.22/_mget",
+            "index_not_found_exception in an untrusted text response",
+        )
+        text_client.mget.side_effect = text_error
+        with self.assertRaises(scoring.OpenSearchHTTPError) as raised:
+            scoring.load_existing_states(text_client, [reference], base_config())
+        self.assertIs(raised.exception, text_error)
+
+    def test_missing_destination_bootstrap_writes_and_reruns_idempotently(self) -> None:
+        config = base_config()
+        buckets = aggregate_cases(["bootstrap-rule"], config)
+        client = BootstrapBulkClient()
+
+        first_written = scoring.process_buckets_bulk(client, config, buckets)
+        first_event_ids = set(client.events)
+        first_state = next(iter(client.states.values()))
+        second_written = scoring.process_buckets_bulk(client, config, buckets)
+
+        self.assertEqual(first_written, 2)
+        self.assertEqual(second_written, 1)
+        self.assertEqual(len(client.events), 1)
+        self.assertEqual(set(client.events), first_event_ids)
+        self.assertEqual(len(client.states), 1)
+        self.assertEqual(next(iter(client.states.values()))["alarm"]["event_count"], 3)
+        self.assertEqual(
+            next(iter(client.states.values()))["risk"]["level_history"],
+            first_state["risk"]["level_history"],
+        )
 
     def test_bulk_batches_use_utf8_byte_limit_and_reject_oversized_document(self) -> None:
         first = {

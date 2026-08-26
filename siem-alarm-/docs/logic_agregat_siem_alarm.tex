@@ -1165,6 +1165,17 @@ closed bucket yang diproses per run dibatasi, default dua. Bila source index unt
 bucket yang diperlukan tidak tersedia, run gagal dan checkpoint tidak maju. Operator
 harus menyelidiki retensi atau menjalankan backfill terkontrol.
 
+Destination berbeda dari source. Pada run non-kosong pertama dan rollover tanggal
+UTC, concrete daily destination memang belum ada. OpenSearch 2.19 dapat mengembalikan
+\code{\_mget} HTTP 200 dengan satu \code{index\_not\_found\_exception} per ID tanpa
+field status.\cite{osmget,osmgetsource} Engine menerima kondisi bootstrap ini hanya ketika seluruh item batch
+menyebut \code{error.type} dan \code{error.index} yang tepat untuk concrete index
+yang diminta. Seluruh state dianggap baru dan two-phase bulk pertama membuat index
+melalui template yang telah terpasang. Respons campuran, index berbeda, status
+bertentangan, atau flip ada/hilang pada retry batch yang sama tetap gagal tertutup.
+Delete eksternal di antara batch tidak dapat dibuat atomik oleh API; operasi itu
+tidak didukung dan prosedur stop-before-delete tetap wajib.
+
 Manual backfill harus memakai waktu UTC yang aligned dengan boundary:
 
 \begin{lstlisting}
@@ -1182,8 +1193,11 @@ tidak dapat dicapai, naikkan delay atau jadwalkan prosedur reconciliation.
 
 \chapter{Fail-Closed dan Guardrail}
 
-Engine memilih gagal tanpa menulis state parsial ketika menemukan keadaan yang
-dapat membuat count salah. Contohnya:
+Engine memilih gagal tertutup ketika menemukan keadaan yang dapat membuat count
+salah. Error sebelum bulk pertama tidak menulis destination apa pun. Error pada
+batch/fase write yang lebih akhir dapat meninggalkan write deterministik yang sudah
+diterima Indexer, tetapi checkpoint tidak maju; ID deterministik, create-only
+escalation, dan rerun membuat state konvergen tanpa menggandakan event. Contohnya:
 
 \begin{itemize}
   \item timestamp, agent ID, rule ID, atau rule level wajib tidak valid;
@@ -1196,6 +1210,13 @@ dapat membuat count salah. Contohnya:
   \item asset inventory stale atau tidak valid;
   \item checkpoint rusak atau hash identitas berbeda.
 \end{itemize}
+
+Missing daily destination bukan error apabila predicate bootstrap ketat di atas
+terpenuhi. Kondisi itu dicatat sebagai INFO karena normal sekali per tanggal UTC.
+Jika pesan yang sama muncul untuk index yang sebelumnya ada, operator harus
+menganggapnya indikasi delete/race, menghentikan timer, dan menjalankan audit serta
+controlled backfill. Membuat ulang index dengan checkpoint lama tidak mengembalikan
+bucket historis yang telah dilewati.
 
 Default cap 100.000 raw alert dan 20.000 case per bucket adalah ceiling keselamatan,
 bukan kapasitas yang dijanjikan. Membagi bucket di tengah setelah cap tercapai akan
@@ -1423,6 +1444,7 @@ Asset default & Lengkapi inventory, periksa agent ID/name, dan audit re-enrollme
 Service timeout & Ukur EPS/cardinality dan Indexer pressure; jangan langsung menaikkan cap.\\
 Checkpoint mismatch & Ada perubahan identitas case; gunakan shadow prefix atau controlled migration.\\
 Escalation tampak ganda & Filter berdasarkan \code{escalation.id}; create-only seharusnya menghasilkan satu ID per level.\\
+\code{\_mget index\_not\_found} & Normal pada first nonempty run atau rollover bila log menyebut bootstrap. Jika index sebelumnya ada, hentikan timer dan audit delete/backfill; jangan menghapus checkpoint.\\
 \bottomrule
 \end{longtable}
 
@@ -1615,6 +1637,10 @@ OpenSearch, \emph{Bulk API}.\\
 \bibitem{osmget}
 OpenSearch, \emph{Multi-get Documents API}.\\
 \url{https://docs.opensearch.org/latest/api-reference/document-apis/multi-get/}
+
+\bibitem{osmgetsource}
+OpenSearch 2.19, \emph{MultiGetResponse.java: failure serialization}.\\
+\url{https://github.com/opensearch-project/OpenSearch/blob/2.19/server/src/main/java/org/opensearch/action/get/MultiGetResponse.java}
 
 \bibitem{osism}
 OpenSearch, \emph{Index State Management Policies}.\\

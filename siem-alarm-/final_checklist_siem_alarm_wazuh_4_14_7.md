@@ -1,6 +1,6 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.7 AIO
 
-> **Versi 5.2** — Wazuh 4.14.7 compatibility + Production-hardened Snapshot-Bulk V2
+> **Versi 5.3** — Wazuh 4.14.7 compatibility + Production-hardened Snapshot-Bulk V2
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
@@ -1035,6 +1035,26 @@ masih memakai threshold numerik yang tidak kompatibel dengan Wazuh Indexer
 `track_total_hits=true`; kegagalan ini terjadi sebelum pagination, bulk, dan
 checkpoint, sehingga jangan menghapus index atau checkpoint sebagai respons.
 
+Jika log berhenti setelah `Raw snapshot read complete` dengan `_mget failed` dan
+`error.type=index_not_found_exception` untuk `siem-alarm-YYYY.MM.DD`, scorer yang
+terpasang belum menangani bentuk canonical OpenSearch 2.19: HTTP 200 dengan error
+per-item tanpa field `status`. Upgrade ke source proyek versi 5.3 atau lebih baru.
+Engine terkini hanya menerima missing-index jika seluruh item batch memiliki
+`error.type` dan `error.index` yang tepat; state dianggap baru dan bulk pertama
+akan auto-create daily index melalui template. Error `_mget` lain, respons campuran,
+atau flip keberadaan index pada retry batch yang sama tetap menghentikan run.
+Penghapusan eksternal di antara batch tidak dapat dibuat atomik oleh API dan tidak
+didukung; prosedur stop-before-delete tetap wajib.
+
+Untuk batch yang gagal sebelum bulk tidak ada write dari batch tersebut, dan
+checkpoint run tidak maju. Bila kegagalan muncul pada window/batch yang lebih akhir,
+write deterministik dari batch sebelumnya mungkin sudah diterima dan aman direplay.
+Jangan membuat destination secara manual dan jangan menghapus checkpoint. Pesan INFO
+missing destination normal pada first nonempty run dan rollover UTC; bila terjadi
+pada index yang sebelumnya ada, hentikan timer dan investigasi penghapusan. Restart
+biasa dapat membuat index baru tanpa memulihkan history lama yang sudah dilewati
+checkpoint.
+
 **Cek python path:**
 ```bash
 test -x /usr/bin/python3 && /usr/bin/python3 --version
@@ -1333,7 +1353,7 @@ sha256("escalation|" + alarm.id + "|" + risk.level)
 
 Satu `alarm.id` + satu `risk.level` hanya menghasilkan satu dokumen `alarm_escalation` per bucket. Jika 5 menit berikutnya level tetap sama, script hanya meng-update `alarm_state` dan tidak membuat log eskalasi baru.
 
-Script memakai endpoint create-only (`PUT <index>/_create/<escalation.id>`) dan memperlakukan HTTP 409 sebagai "sudah ada". Escalation event dibuat **sebelum** state di-update. Jika state write gagal, run berikutnya menemukan escalation ID yang sama lalu mengulangi state write; event tidak hilang dan tidak terduplikasi.
+Script memakai action `create` di dalam per-index `_bulk` dan memperlakukan status item 409 sebagai "sudah ada". Escalation event dibuat **sebelum** state di-update. Jika state write gagal, run berikutnya menemukan escalation ID yang sama lalu mengulangi state write; event tidak hilang dan tidak terduplikasi.
 
 ### 16.4 Contoh query untuk aplikasi eksternal
 
@@ -1642,4 +1662,4 @@ Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehila
 
 ---
 
-*Versi 5.2 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, exact daily source index, scroll-compatible exact hit tracking, source filtering, Snapshot-Bulk V2 (`_mget` + two-phase `_bulk`), asset inventory tervalidasi, cardinality/checkpoint/catch-up bounded, least-privilege bulk permission, resource-capped systemd, OnFailure journal handler, TLS mandatory, deterministic escalation/state, backup installer, template, dan ISM retention.*
+*Versi 5.3 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, exact daily source index, scroll-compatible exact hit tracking, canonical missing-destination `_mget` bootstrap, source filtering, Snapshot-Bulk V2 (`_mget` + two-phase `_bulk`), asset inventory tervalidasi, cardinality/checkpoint/catch-up bounded, least-privilege bulk permission, resource-capped systemd, OnFailure journal handler, TLS mandatory, deterministic escalation/state, backup installer, template, dan ISM retention.*
