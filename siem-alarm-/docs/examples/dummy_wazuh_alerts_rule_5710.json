@@ -1,0 +1,137 @@
+{
+  "notice": "DATA SINTETIS UNTUK DOKUMENTASI; bukan hasil tangkapan sistem produksi.",
+  "format_basis": "Bentuk hit OpenSearch wazuh-alerts-4.x-* dan rule default Wazuh 5710 (sshd: Attempt to login using a non-existent user).",
+  "ip_note": "203.0.113.0/24, 198.51.100.0/24, dan 192.0.2.0/24 adalah rentang TEST-NET untuk dokumentasi.",
+  "documents": [
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26",
+      "_id": "dummy-5710-001",
+      "_source": {
+        "timestamp": "2026-08-26T10:05:11.123+0000",
+        "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"},
+        "id": "1787748311.100001",
+        "input": {"type": "log"},
+        "full_log": "Aug 26 17:05:11 srv-web-01 sshd[24101]: Invalid user oracle from 203.0.113.10 port 51101",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:05:11", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"},
+        "data": {"srcip": "203.0.113.10", "srcport": "51101", "srcuser": "oracle"},
+        "location": "/var/log/auth.log",
+        "rule": {
+          "id": "5710", "level": 5, "firedtimes": 1, "mail": false,
+          "description": "sshd: Attempt to login using a non-existent user",
+          "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"],
+          "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}
+        }
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-002",
+      "_source": {
+        "timestamp": "2026-08-26T10:06:22.234+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748382.100002", "input": {"type": "log"},
+        "full_log": "Aug 26 17:06:22 srv-web-01 sshd[24112]: Invalid user test from 203.0.113.10 port 51112",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:06:22", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "203.0.113.10", "srcport": "51112", "srcuser": "test"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 2, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-003",
+      "_source": {
+        "timestamp": "2026-08-26T10:07:35.345+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748455.100003", "input": {"type": "log"},
+        "full_log": "Aug 26 17:07:35 srv-web-01 sshd[24123]: Invalid user admin from 198.51.100.24 port 51123",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:07:35", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "198.51.100.24", "srcport": "51123", "srcuser": "admin"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 3, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-004",
+      "_source": {
+        "timestamp": "2026-08-26T10:08:47.456+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748527.100004", "input": {"type": "log"},
+        "full_log": "Aug 26 17:08:47 srv-web-01 sshd[24134]: Invalid user postgres from 203.0.113.10 port 51134",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:08:47", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "203.0.113.10", "srcport": "51134", "srcuser": "postgres"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 4, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-005",
+      "_source": {
+        "timestamp": "2026-08-26T10:10:02.567+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748602.100005", "input": {"type": "log"},
+        "full_log": "Aug 26 17:10:02 srv-web-01 sshd[24145]: Invalid user deploy from 192.0.2.44 port 51145",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:10:02", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "192.0.2.44", "srcport": "51145", "srcuser": "deploy"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 5, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-006",
+      "_source": {
+        "timestamp": "2026-08-26T10:11:18.678+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748678.100006", "input": {"type": "log"},
+        "full_log": "Aug 26 17:11:18 srv-web-01 sshd[24156]: Invalid user guest from 198.51.100.24 port 51156",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:11:18", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "198.51.100.24", "srcport": "51156", "srcuser": "guest"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 6, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-007",
+      "_source": {
+        "timestamp": "2026-08-26T10:12:29.789+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748749.100007", "input": {"type": "log"},
+        "full_log": "Aug 26 17:12:29 srv-web-01 sshd[24167]: Invalid user ubuntu from 203.0.113.10 port 51167",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:12:29", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "203.0.113.10", "srcport": "51167", "srcuser": "ubuntu"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 7, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-008",
+      "_source": {
+        "timestamp": "2026-08-26T10:14:40.890+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787748880.100008", "input": {"type": "log"},
+        "full_log": "Aug 26 17:14:40 srv-web-01 sshd[24178]: Invalid user backup from 198.51.100.24 port 51178",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:14:40", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "198.51.100.24", "srcport": "51178", "srcuser": "backup"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 8, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-009",
+      "_source": {
+        "timestamp": "2026-08-26T10:16:51.901+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787749011.100009", "input": {"type": "log"},
+        "full_log": "Aug 26 17:16:51 srv-web-01 sshd[24189]: Invalid user support from 203.0.113.10 port 51189",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:16:51", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "203.0.113.10", "srcport": "51189", "srcuser": "support"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 9, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    },
+    {
+      "_index": "wazuh-alerts-4.x-2026.08.26", "_id": "dummy-5710-010",
+      "_source": {
+        "timestamp": "2026-08-26T10:18:03.012+0000", "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+        "manager": {"name": "wazuh-aio"}, "id": "1787749083.100010", "input": {"type": "log"},
+        "full_log": "Aug 26 17:18:03 srv-web-01 sshd[24200]: Invalid user admin from 192.0.2.44 port 51200",
+        "predecoder": {"program_name": "sshd", "timestamp": "Aug 26 17:18:03", "hostname": "srv-web-01"},
+        "decoder": {"parent": "sshd", "name": "sshd"}, "data": {"srcip": "192.0.2.44", "srcport": "51200", "srcuser": "admin"},
+        "location": "/var/log/auth.log",
+        "rule": {"id": "5710", "level": 5, "firedtimes": 10, "mail": false, "description": "sshd: Attempt to login using a non-existent user", "groups": ["syslog", "sshd", "invalid_login", "authentication_failed"], "mitre": {"id": ["T1110"], "tactic": ["Credential Access"], "technique": ["Brute Force"]}}
+      }
+    }
+  ]
+}

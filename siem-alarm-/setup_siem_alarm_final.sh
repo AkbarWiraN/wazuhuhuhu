@@ -4,6 +4,7 @@ umask 027
 
 BASE_DIR="/opt/wazuh-risk-scoring"
 CONFIG_DIR="/etc/wazuh-risk-scoring"
+STATE_DIR="/var/lib/wazuh-risk-scoring"
 SERVICE_USER="siem-alarm"
 SERVICE_GROUP="siem-alarm"
 EXPECTED_WAZUH_VERSION="4.14.7"
@@ -22,6 +23,7 @@ required_files=(
   "assets.example.json"
   "final_checklist_siem_alarm_wazuh_4_14_7.md"
   "tests/test_siem_alarm_scoring.py"
+  "tests/test_wazuh_field_audit.py"
 )
 
 die() {
@@ -45,12 +47,33 @@ if [[ "${EUID}" -ne 0 ]]; then
   die "Run this installer as root: sudo bash ${SCRIPT_DIR}/setup_siem_alarm_final.sh"
 fi
 
-for command_name in /usr/bin/python3 dpkg-query filebeat openssl systemctl systemd-analyze install useradd groupadd getent id chown chmod cp tee date; do
+for command_name in /usr/bin/python3 /usr/bin/logger dpkg-query filebeat openssl systemctl systemd-analyze install useradd groupadd getent id chown chmod cp tee date; do
   command -v "${command_name}" >/dev/null 2>&1 || die "Required command not found: ${command_name}"
 done
 
 for file_name in "${required_files[@]}"; do
-  [[ -f "${SCRIPT_DIR}/${file_name}" ]] || die "Required source file not found: ${SCRIPT_DIR}/${file_name}"
+  [[ -f "${SCRIPT_DIR}/${file_name}" && ! -L "${SCRIPT_DIR}/${file_name}" ]] \
+    || die "Required source must be a regular non-symlink file: ${SCRIPT_DIR}/${file_name}"
+done
+
+for managed_path in \
+  "${BASE_DIR}" \
+  "${BASE_DIR}/logs" \
+  "${CONFIG_DIR}" \
+  "${STATE_DIR}" \
+  "${BASE_DIR}/siem_alarm_scoring_final.py" \
+  "${BASE_DIR}/wazuh_field_audit_final.py" \
+  "${BASE_DIR}/siem_alarm_template_final.json" \
+  "${BASE_DIR}/siem_alarm_ism_policy.json" \
+  "${BASE_DIR}/config.siem_alarm.json" \
+  "${BASE_DIR}/assets.json" \
+  "${BASE_DIR}/root-ca.pem" \
+  "${CONFIG_DIR}/siem-alarm.env" \
+  "/etc/systemd/system/siem-alarm-scoring.service" \
+  "/etc/systemd/system/siem-alarm-scoring-failure@.service" \
+  "/etc/systemd/system/siem-alarm-scoring.timer" \
+  "/etc/logrotate.d/siem-alarm-scoring"; do
+  [[ ! -L "${managed_path}" ]] || die "Refusing managed symbolic link: ${managed_path}"
 done
 
 check_package_version() {
@@ -101,6 +124,8 @@ echo "[+] Pre-validating source files"
 /usr/bin/python3 -c 'import ast, pathlib, sys; [ast.parse(pathlib.Path(p).read_text(encoding="utf-8"), filename=p) for p in sys.argv[1:]]' \
   "${SCRIPT_DIR}/siem_alarm_scoring_final.py" \
   "${SCRIPT_DIR}/wazuh_field_audit_final.py"
+/usr/bin/python3 -B "${SCRIPT_DIR}/siem_alarm_scoring_final.py" \
+  --validate-assets-only "${SCRIPT_DIR}/assets.example.json" >/dev/null
 (
   cd -- "${SCRIPT_DIR}"
   /usr/bin/python3 -B -m unittest discover -s tests -v
@@ -109,10 +134,25 @@ echo "[+] Pre-validating source files"
 if [[ -f "${BASE_DIR}/config.siem_alarm.json" ]]; then
   /usr/bin/python3 -m json.tool "${BASE_DIR}/config.siem_alarm.json" >/dev/null \
     || die "Existing config.siem_alarm.json is invalid JSON; no files were changed"
+  /usr/bin/python3 -c '
+import json, sys
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+if "password" in config:
+    raise SystemExit("inline password is forbidden; use password_env=WAZUH_PASS")
+if str(config.get("username", "")).lower() == "admin":
+    raise SystemExit("runtime username admin is forbidden; use siem_alarm_service")
+' "${BASE_DIR}/config.siem_alarm.json" \
+    || die "Existing config has unsafe runtime credentials; no files were changed"
 fi
 if [[ -f "${BASE_DIR}/assets.json" ]]; then
   /usr/bin/python3 -m json.tool "${BASE_DIR}/assets.json" >/dev/null \
     || die "Existing assets.json is invalid JSON; no files were changed"
+  /usr/bin/python3 -B "${SCRIPT_DIR}/siem_alarm_scoring_final.py" \
+    --validate-assets-only "${BASE_DIR}/assets.json" >/dev/null \
+    || die "Existing assets.json fails schema validation; no files were changed"
+fi
+if [[ -L "${STATE_DIR}/checkpoint.json" ]]; then
+  die "Refusing symbolic-link checkpoint: ${STATE_DIR}/checkpoint.json"
 fi
 
 TIMER_WAS_ENABLED=0
@@ -141,9 +181,23 @@ if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --gid "${SERVICE_GROUP}" --home-dir "${BASE_DIR}" --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
 
+IFS=: read -r _ _ service_group_gid service_group_members \
+  <<<"$(getent group "${SERVICE_GROUP}")"
+IFS=: read -r _ _ _ service_user_gid _ service_user_home service_user_shell \
+  <<<"$(getent passwd "${SERVICE_USER}")"
+[[ "${service_user_gid}" == "${service_group_gid}" ]] \
+  || die "Existing ${SERVICE_USER} must use ${SERVICE_GROUP} as its primary group"
+[[ "${service_user_home}" == "${BASE_DIR}" ]] \
+  || die "Existing ${SERVICE_USER} must use home ${BASE_DIR}; found ${service_user_home}"
+[[ "${service_user_shell}" == "/usr/sbin/nologin" ]] \
+  || die "Existing ${SERVICE_USER} must use /usr/sbin/nologin; found ${service_user_shell}"
+[[ -z "${service_group_members}" || "${service_group_members}" == "${SERVICE_USER}" ]] \
+  || die "Group ${SERVICE_GROUP} has unexpected members and would expose runtime secrets: ${service_group_members}"
+
 install -d -o root -g "${SERVICE_GROUP}" -m 0750 "${BASE_DIR}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 "${BASE_DIR}/logs"
 install -d -o root -g "${SERVICE_GROUP}" -m 0750 "${CONFIG_DIR}"
+install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 "${STATE_DIR}"
 
 backup_if_exists() {
   local source_path="$1"
@@ -158,7 +212,13 @@ for existing_path in \
   "${BASE_DIR}/wazuh_field_audit_final.py" \
   "${BASE_DIR}/siem_alarm_template_final.json" \
   "${BASE_DIR}/siem_alarm_ism_policy.json" \
+  "${BASE_DIR}/config.siem_alarm.json" \
+  "${BASE_DIR}/assets.json" \
+  "${BASE_DIR}/root-ca.pem" \
+  "${CONFIG_DIR}/siem-alarm.env" \
+  "${STATE_DIR}/checkpoint.json" \
   "/etc/systemd/system/siem-alarm-scoring.service" \
+  "/etc/systemd/system/siem-alarm-scoring-failure@.service" \
   "/etc/systemd/system/siem-alarm-scoring.timer" \
   "/etc/logrotate.d/siem-alarm-scoring"; do
   backup_if_exists "${existing_path}"
@@ -188,9 +248,8 @@ else
 fi
 
 if [[ ! -f "${BASE_DIR}/assets.json" ]]; then
-  install -o root -g "${SERVICE_GROUP}" -m 0640 \
-    "${SCRIPT_DIR}/assets.example.json" \
-    "${BASE_DIR}/assets.json"
+  install -o root -g "${SERVICE_GROUP}" -m 0640 /dev/null "${BASE_DIR}/assets.json"
+  printf '{}\n' >"${BASE_DIR}/assets.json"
 else
   echo "[!] Existing assets.json preserved"
 fi
@@ -210,6 +269,10 @@ chmod 0640 \
   "${BASE_DIR}/config.siem_alarm.json" \
   "${BASE_DIR}/assets.json" \
   "${CONFIG_DIR}/siem-alarm.env"
+if [[ -f "${STATE_DIR}/checkpoint.json" ]]; then
+  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${STATE_DIR}/checkpoint.json"
+  chmod 0600 "${STATE_DIR}/checkpoint.json"
+fi
 
 /usr/bin/python3 -m json.tool "${BASE_DIR}/config.siem_alarm.json" >/dev/null
 /usr/bin/python3 -m json.tool "${BASE_DIR}/assets.json" >/dev/null
@@ -226,6 +289,28 @@ if config.get("verify_ssl") is not True:
     print("set verify_ssl=true and verify the installed root CA")
 if config.get("install_template") is not False:
     print("set install_template=false after one-time template installation")
+source_pattern = str(config.get("source_index", ""))
+if source_pattern.count("{date}") != 1:
+    print("use an exact daily source_index with one {date} placeholder; default wazuh-alerts-4.x-{date}")
+elif source_pattern != "wazuh-alerts-4.x-{date}":
+    print("verify the custom source_index date pattern, UTC boundary, and late-alert behavior before go-live")
+if "max_alerts_per_run" in config:
+    print("replace legacy max_alerts_per_run with max_alerts_per_bucket=100000")
+    print("review lookback_overlap_minutes: V2 treats it as closed-bucket finalization delay, not a combined overlap window")
+required_v2 = {
+    "checkpoint_file": "/var/lib/wazuh-risk-scoring/checkpoint.json",
+    "max_alerts_per_bucket": 100000,
+    "max_cases_per_bucket": 20000,
+    "mget_batch_size": 1000,
+    "bulk_max_actions": 1000,
+    "bulk_max_bytes": 5242880,
+    "max_catchup_buckets_per_run": 2,
+}
+for key, value in required_v2.items():
+    if key not in config:
+        print(f"add {key}={value!r} for Snapshot-Bulk V2")
+if "checkpoint_file" in config and config.get("checkpoint_file") != "/var/lib/wazuh-risk-scoring/checkpoint.json":
+    print("set checkpoint_file=/var/lib/wazuh-risk-scoring/checkpoint.json or update the systemd write sandbox explicitly")
 ' "${BASE_DIR}/config.siem_alarm.json")
 
 echo "[+] Installing hardened systemd units"
@@ -233,7 +318,8 @@ tee /etc/systemd/system/siem-alarm-scoring.service >/dev/null <<EOF
 [Unit]
 Description=SIEM Alarm Scoring - Wazuh Progressive Alarm Aggregation
 After=network-online.target wazuh-indexer.service
-Wants=network-online.target wazuh-indexer.service
+Wants=network-online.target
+OnFailure=siem-alarm-scoring-failure@%n.service
 
 [Service]
 Type=oneshot
@@ -244,6 +330,8 @@ ExecStart=/usr/bin/python3 -B ${BASE_DIR}/siem_alarm_scoring_final.py --config $
 WorkingDirectory=${BASE_DIR}
 RuntimeDirectory=siem-alarm
 RuntimeDirectoryMode=0750
+StateDirectory=wazuh-risk-scoring
+StateDirectoryMode=0750
 UMask=0027
 StandardOutput=journal
 StandardError=journal
@@ -252,10 +340,36 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${BASE_DIR}/logs
+ReadWritePaths=${BASE_DIR}/logs ${STATE_DIR}
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+RuntimeMaxSec=240s
+TimeoutStopSec=20s
+MemoryHigh=512M
+MemoryMax=1G
+MemorySwapMax=0
+TasksMax=64
+LimitNOFILE=4096
+Nice=5
+CPUWeight=25
+IOWeight=25
+OOMScoreAdjust=500
+CapabilityBoundingSet=
+AmbientCapabilities=
+EOF
+
+tee /etc/systemd/system/siem-alarm-scoring-failure@.service >/dev/null <<'EOF'
+[Unit]
+Description=Record SIEM Alarm Scoring failure for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t siem-alarm-scoring "Unit %i failed; inspect journalctl -u %i"
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 EOF
@@ -288,12 +402,15 @@ ${BASE_DIR}/logs/*.log {
 EOF
 
 chmod 0644 /etc/systemd/system/siem-alarm-scoring.service
+chmod 0644 /etc/systemd/system/siem-alarm-scoring-failure@.service
 chmod 0644 /etc/systemd/system/siem-alarm-scoring.timer
 chmod 0644 /etc/logrotate.d/siem-alarm-scoring
 
 echo "[+] Validating installed files and systemd units"
 /usr/bin/python3 -m json.tool "${BASE_DIR}/config.siem_alarm.json" >/dev/null
 /usr/bin/python3 -m json.tool "${BASE_DIR}/assets.json" >/dev/null
+/usr/bin/python3 -B "${BASE_DIR}/siem_alarm_scoring_final.py" \
+  --validate-assets-only "${BASE_DIR}/assets.json" >/dev/null
 /usr/bin/python3 -m json.tool "${BASE_DIR}/siem_alarm_template_final.json" >/dev/null
 /usr/bin/python3 -m json.tool "${BASE_DIR}/siem_alarm_ism_policy.json" >/dev/null
 /usr/bin/python3 -c 'import ast, pathlib, sys; [ast.parse(pathlib.Path(p).read_text(encoding="utf-8"), filename=p) for p in sys.argv[1:]]' \
@@ -301,6 +418,7 @@ echo "[+] Validating installed files and systemd units"
   "${BASE_DIR}/wazuh_field_audit_final.py"
 systemd-analyze verify \
   /etc/systemd/system/siem-alarm-scoring.service \
+  /etc/systemd/system/siem-alarm-scoring-failure@.service \
   /etc/systemd/system/siem-alarm-scoring.timer
 systemctl daemon-reload
 
@@ -313,6 +431,7 @@ echo "[!] Create the dedicated Wazuh Indexer role/user, then edit:"
 echo "    ${BASE_DIR}/config.siem_alarm.json"
 echo "    ${BASE_DIR}/assets.json"
 echo "    ${CONFIG_DIR}/siem-alarm.env"
+echo "[!] Monitor journal tag 'siem-alarm-scoring'; the OnFailure handler records daemon.crit but does not send an external notification by itself."
 echo
 echo "[+] Recommended next document:"
 echo "    ${SCRIPT_DIR}/final_checklist_siem_alarm_wazuh_4_14_7.md"

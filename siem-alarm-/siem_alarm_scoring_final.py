@@ -8,6 +8,10 @@ Core design:
 - Read raw alerts from wazuh-alerts-*.
 - Preserve wazuh-alerts-* as raw evidence.
 - Write aggregated alarms to siem-alarm-YYYY.MM.DD.
+- Read exact daily indexes with bounded, complete bucket snapshots.
+- Batch existing-state reads with per-index _mget.
+- Write create-only escalation events before idempotent state via bounded _bulk.
+- Advance an atomic local checkpoint only after every planned window succeeds.
 - Default same-alert definition is deliberately coarse:
     agent.id + rule.id + timestamp_bucket_1h
 - srcip/dstip/dstport/proto/url/user/file fields are evidence only, not default split keys.
@@ -48,6 +52,75 @@ except ImportError:  # pragma: no cover - the production target is Linux.
     fcntl = None
 
 
+# Keep the payload sent by Wazuh Indexer intentionally small. Operators can
+# extend this allow-list through source_includes for fields produced by custom
+# decoders. The raw document remains available in wazuh-alerts-* as evidence.
+DEFAULT_SOURCE_INCLUDES = [
+    "timestamp",
+    "agent.id",
+    "agent.name",
+    "agent.ip",
+    "agent.labels",
+    "rule.id",
+    "rule.level",
+    "rule.description",
+    "rule.groups",
+    "rule.group",
+    "decoder.name",
+    "srcip",
+    "dstip",
+    "dstport",
+    "proto",
+    "protocol",
+    "source.ip",
+    "destination.ip",
+    "destination.port",
+    "network.transport",
+    "url.path",
+    "http.request.referrer",
+    "user.name",
+    "user_agent.original",
+    "file.path",
+    "file.hash.sha256",
+    "syscheck.path",
+    "syscheck.sha256",
+    "syscheck.sha256_after",
+    "rootcheck.file",
+    "vulnerability.cve",
+    "sca.check.id",
+    "data.srcip",
+    "data.src_ip",
+    "data.dstip",
+    "data.dest_ip",
+    "data.dstport",
+    "data.dest_port",
+    "data.proto",
+    "data.protocol",
+    "data.url",
+    "data.user",
+    "data.dstuser",
+    "data.srcuser",
+    "data.file",
+    "data.sha256",
+    "data.hash",
+    "data.http.url",
+    "data.http.hostname",
+    "data.http.user_agent",
+    "data.http_user_agent",
+    "data.source.ip",
+    "data.destination.ip",
+    "data.destination.port",
+    "data.vulnerability.cve",
+    "data.sca.check.id",
+    "data.win.eventdata.IpAddress",
+    "data.win.eventdata.ipAddress",
+    "data.win.eventdata.TargetUserName",
+    "data.win.eventdata.SubjectUserName",
+]
+
+BULK_RETRYABLE_STATUSES = {429, 502, 503, 504}
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -59,11 +132,16 @@ def iso_z(value: dt.datetime) -> str:
 def parse_dt(value: Any) -> Optional[dt.datetime]:
     if value is None:
         return None
-    text = str(value)
+    text = str(value).strip()
     if not text:
         return None
     try:
-        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        # Wazuh's native alert timestamp commonly uses ±HHMM (for example
+        # +0000 or +0300). Normalize it for consistent Python 3.9+ parsing.
+        text = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", text)
+        parsed = dt.datetime.fromisoformat(text)
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             return None
         return parsed
@@ -188,13 +266,29 @@ class OpenSearchClient:
             "Accept": "application/json",
         }
 
-    def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Any] = None,
+        params: Optional[Dict[str, Any]] = None,
+        content_type: str = "application/json",
+        attempts: Optional[int] = None,
+    ) -> Dict[str, Any]:
         url = f"{self.base_url}/{path.lstrip('/')}"
         if params:
             url += "?" + urllib.parse.urlencode(params)
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(url, data=data, headers=self.headers, method=method.upper())
-        for attempt in range(1, self.retry_attempts + 1):
+        if isinstance(body, bytes):
+            data = body
+        elif isinstance(body, str):
+            data = body.encode("utf-8")
+        else:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+        headers = dict(self.headers)
+        headers["Content-Type"] = content_type
+        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+        request_attempts = self.retry_attempts if attempts is None else max(1, int(attempts))
+        for attempt in range(1, request_attempts + 1):
             try:
                 with urllib.request.urlopen(req, context=self.ctx, timeout=self.timeout) as response:
                     raw = response.read().decode("utf-8")
@@ -202,23 +296,35 @@ class OpenSearchClient:
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
                 error = OpenSearchHTTPError(exc.code, method, url, error_body)
-                if exc.code not in self.RETRYABLE_HTTP_STATUSES or attempt == self.retry_attempts:
+                if exc.code not in self.RETRYABLE_HTTP_STATUSES or attempt == request_attempts:
                     raise error from exc
-                self._wait_before_retry(attempt, error)
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                self._wait_before_retry(attempt, request_attempts, error, retry_after)
             except urllib.error.URLError as exc:
                 error = RuntimeError(f"OpenSearch connection error {method} {url}: {exc}")
-                if attempt == self.retry_attempts:
+                if attempt == request_attempts:
                     raise error from exc
-                self._wait_before_retry(attempt, error)
+                self._wait_before_retry(attempt, request_attempts, error)
         raise RuntimeError(f"OpenSearch request exhausted retries: {method} {url}")
 
-    def _wait_before_retry(self, attempt: int, error: Exception) -> None:
+    def _wait_before_retry(
+        self,
+        attempt: int,
+        attempts: int,
+        error: Exception,
+        retry_after: Optional[str] = None,
+    ) -> None:
         delay = self.retry_backoff_seconds * (2 ** (attempt - 1))
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
         delay += random.uniform(0, min(1.0, delay * 0.25)) if delay else 0.0
         logging.warning(
             "OpenSearch request failed (attempt %d/%d): %s; retrying in %.2fs",
             attempt,
-            self.retry_attempts,
+            attempts,
             error,
             delay,
         )
@@ -227,44 +333,44 @@ class OpenSearchClient:
     def put_template(self, name: str, template: Dict[str, Any]) -> Dict[str, Any]:
         return self.request("PUT", f"_index_template/{name}", template)
 
-    def index_doc(self, index: str, doc_id: str, doc: Dict[str, Any]) -> Dict[str, Any]:
-        quoted = urllib.parse.quote(doc_id, safe="")
-        return self.request("PUT", f"{index}/_doc/{quoted}", doc)
-
-    def create_doc_if_absent(self, index: str, doc_id: str, doc: Dict[str, Any]) -> bool:
-        quoted = urllib.parse.quote(doc_id, safe="")
-        try:
-            self.request("PUT", f"{index}/_create/{quoted}", doc)
-            return True
-        except OpenSearchHTTPError as exc:
-            if exc.status == 409:
-                return False
-            raise
-
-    def get_doc(self, index: str, doc_id: str) -> Optional[Dict[str, Any]]:
-        quoted = urllib.parse.quote(doc_id, safe="")
-        try:
-            response = self.request("GET", f"{index}/_doc/{quoted}")
-        except OpenSearchHTTPError as exc:
-            if exc.status == 404:
-                return None
-            raise
-        if not response.get("found", False):
-            return None
-        source = response.get("_source")
-        return source if isinstance(source, dict) else None
-
     def search(self, index: str, body: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return self.request("POST", f"{index}/_search", body, params)
 
     def scroll(self, scroll_id: str, keepalive: str) -> Dict[str, Any]:
-        return self.request("POST", "_search/scroll", {"scroll": keepalive, "scroll_id": scroll_id})
+        # A lost scroll response is ambiguous: retrying the same cursor can
+        # advance the context twice. The caller restarts the whole read bucket.
+        return self.request(
+            "POST",
+            "_search/scroll",
+            {"scroll": keepalive, "scroll_id": scroll_id},
+            attempts=1,
+        )
 
     def clear_scroll(self, scroll_id: str) -> None:
         try:
-            self.request("DELETE", "_search/scroll", {"scroll_id": [scroll_id]})
+            self.request("DELETE", "_search/scroll", {"scroll_id": [scroll_id]}, attempts=1)
         except Exception as exc:
             logging.debug("clear_scroll failed: %s", exc)
+
+    def mget(self, index: str, ids: List[str]) -> Dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{index}/_mget",
+            {"ids": ids},
+            {
+                "_source_includes": "risk.level,risk.level_history",
+                "realtime": "true",
+            },
+        )
+
+    def bulk(self, index: str, payload: bytes) -> Dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{index}/_bulk",
+            payload,
+            {"refresh": "false"},
+            content_type="application/x-ndjson",
+        )
 
 
 def threat_score(rule_level: int) -> int:
@@ -347,6 +453,100 @@ def asset_category(value: int) -> str:
     return {5: "Critical", 4: "High", 3: "Medium", 2: "Low", 1: "Minimal"}.get(value, "Medium")
 
 
+ASSET_ENTRY_KEYS = {
+    "agent_name",
+    "asset_value",
+    "value",
+    "asset_category",
+    "category",
+    "asset_type",
+    "type",
+    "asset_owner",
+    "owner",
+    "environment",
+    "asset_environment",
+}
+
+
+def parse_asset_value(value: Any, context: str) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{context} must be an integer from 1 to 5, not a boolean")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-5]", value.strip()):
+        parsed = int(value.strip())
+    else:
+        raise RuntimeError(f"{context} must be an integer from 1 to 5")
+    if not 1 <= parsed <= 5:
+        raise RuntimeError(f"{context} must be between 1 and 5")
+    return parsed
+
+
+def validate_assets(assets: Any, source: str = "asset inventory") -> Dict[str, Any]:
+    if not isinstance(assets, dict):
+        raise RuntimeError(f"{source} must contain one top-level JSON object")
+
+    alias_pairs = [
+        ("asset_value", "value"),
+        ("asset_category", "category"),
+        ("asset_type", "type"),
+        ("asset_owner", "owner"),
+        ("environment", "asset_environment"),
+    ]
+    text_fields = {
+        "agent_name",
+        "asset_category",
+        "category",
+        "asset_type",
+        "type",
+        "asset_owner",
+        "owner",
+        "environment",
+        "asset_environment",
+    }
+
+    for lookup_key, entry in assets.items():
+        if (
+            not isinstance(lookup_key, str)
+            or not lookup_key.strip()
+            or lookup_key != lookup_key.strip()
+        ):
+            raise RuntimeError(f"{source} contains an empty, padded, or non-string lookup key")
+        context = f"{source}[{lookup_key!r}]"
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"{context} must be a JSON object")
+        unknown = sorted(set(entry) - ASSET_ENTRY_KEYS)
+        if unknown:
+            raise RuntimeError(f"{context} contains unsupported field(s): {', '.join(unknown)}")
+        for primary, alias in alias_pairs:
+            if primary in entry and alias in entry:
+                raise RuntimeError(f"{context} must not define both {primary} and {alias}")
+        if "asset_value" not in entry and "value" not in entry:
+            raise RuntimeError(f"{context} must define asset_value")
+
+        value = parse_asset_value(entry.get("asset_value", entry.get("value")), f"{context}.asset_value")
+        category = entry.get("asset_category", entry.get("category"))
+        if category is not None and category != asset_category(value):
+            raise RuntimeError(
+                f"{context}.asset_category must be {asset_category(value)!r} for asset_value={value}"
+            )
+        for field_name in text_fields:
+            if field_name in entry and (
+                not isinstance(entry[field_name], str) or not entry[field_name].strip()
+            ):
+                raise RuntimeError(f"{context}.{field_name} must be a non-empty string")
+    return assets
+
+
+def load_asset_inventory(path: Any) -> Dict[str, Any]:
+    asset_path = str(path or "").strip()
+    if not asset_path:
+        raise RuntimeError("assets_file must point to the root-owned asset inventory")
+    if not os.path.isfile(asset_path):
+        raise RuntimeError(f"Asset inventory is missing or not a regular file: {asset_path}")
+    return validate_assets(load_json(asset_path, None), asset_path)
+
+
 def bucket_size_label(minutes: int) -> str:
     if minutes % 60 == 0:
         hours = minutes // 60
@@ -407,14 +607,14 @@ def required_alert_errors(alert: Dict[str, Any]) -> List[str]:
     timestamp = first_value(alert, ["timestamp"], None)
     if parse_dt(timestamp) is None:
         errors.append("timestamp must contain an ISO-8601 timezone")
-    for path in ["agent.id", "rule.id", "rule.description"]:
+    for path in ["agent.id", "rule.id"]:
         if first_value(alert, [path], None) in (None, "", "-", "null", "None"):
             errors.append(f"{path} is required")
     raw_level = first_value(alert, ["rule.level"], None)
     try:
         level = int(str(raw_level))
-        if not 0 <= level <= 15:
-            errors.append("rule.level must be between 0 and 15")
+        if not 0 <= level <= 16:
+            errors.append("rule.level must be between 0 and 16")
     except (TypeError, ValueError):
         errors.append("rule.level must be an integer")
     return errors
@@ -495,47 +695,59 @@ def extract_observed(alert: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 def read_asset_from_labels(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     value = first_value(alert, [
-        "agent.labels.asset.value", "labels.asset.value", "asset.value",
-        "agent.labels.asset_value", "labels.asset_value"
+        "agent.labels.asset.value", "agent.labels.asset_value"
     ])
     if value is None:
         return None
-    asset_value = max(1, min(5, to_int(value, 3)))
+    asset_value = parse_asset_value(value, "agent.labels.asset.value")
+    category = safe_str(first_value(alert, [
+        "agent.labels.asset.category", "agent.labels.asset_category"
+    ], asset_category(asset_value)))
+    if category != asset_category(asset_value):
+        raise RuntimeError(
+            "agent.labels.asset.category must be "
+            f"{asset_category(asset_value)!r} for agent.labels.asset.value={asset_value}"
+        )
     return {
         "value": asset_value,
-        "category": safe_str(first_value(alert, [
-            "agent.labels.asset.category", "labels.asset.category", "asset.category",
-            "agent.labels.asset_category", "labels.asset_category"
-        ], asset_category(asset_value))),
+        "category": category,
         "type": safe_str(first_value(alert, [
-            "agent.labels.asset.type", "labels.asset.type", "asset.type",
-            "agent.labels.asset_type", "labels.asset_type"
+            "agent.labels.asset.type", "agent.labels.asset_type"
         ], "Unknown")),
         "owner": safe_str(first_value(alert, [
-            "agent.labels.asset.owner", "labels.asset.owner", "asset.owner",
-            "agent.labels.asset_owner", "labels.asset_owner"
+            "agent.labels.asset.owner", "agent.labels.asset_owner"
         ], "Unknown")),
         "environment": safe_str(first_value(alert, [
-            "agent.labels.asset.environment", "labels.asset.environment", "asset.environment",
+            "agent.labels.asset.environment",
             "agent.labels.environment"
         ], "Unknown")),
         "source": "agent_label",
     }
 
 
-def get_asset(alert: Dict[str, Any], assets: Dict[str, Any]) -> Dict[str, Any]:
-    labelled = read_asset_from_labels(alert)
-    if labelled:
-        return labelled
-
+def get_asset(
+    alert: Dict[str, Any],
+    assets: Dict[str, Any],
+    warned_missing: Optional[set] = None,
+) -> Dict[str, Any]:
     agent_id = safe_str(first_value(alert, ["agent.id"], "000"))
     agent_name = safe_str(first_value(alert, ["agent.name"], "unknown"))
     entry = assets.get(agent_id) if isinstance(assets, dict) else None
+    matched_by_id = isinstance(entry, dict)
     if not entry and isinstance(assets, dict):
         entry = assets.get(agent_name)
 
     if isinstance(entry, dict):
-        value = max(1, min(5, to_int(entry.get("asset_value", entry.get("value", 3)), 3)))
+        expected_name = entry.get("agent_name")
+        if matched_by_id and expected_name is not None and expected_name != agent_name:
+            raise RuntimeError(
+                f"Asset inventory mismatch for agent.id={agent_id}: expected agent_name={expected_name!r}, "
+                f"alert contains {agent_name!r}. Review re-enrollment or stale inventory before continuing."
+            )
+        value = parse_asset_value(
+            entry.get("asset_value", entry.get("value")),
+            f"asset inventory entry for agent.id={agent_id}",
+        )
         return {
             "value": value,
             "category": safe_str(entry.get("asset_category", entry.get("category", asset_category(value)))),
@@ -545,7 +757,17 @@ def get_asset(alert: Dict[str, Any], assets: Dict[str, Any]) -> Dict[str, Any]:
             "source": "assets_json",
         }
 
-    logging.warning("No asset metadata for agent.id=%s agent.name=%s. Defaulting to Medium.", agent_id, agent_name)
+    # Only Wazuh's official agent.labels namespace is trusted as a fallback.
+    # Root-level labels/asset fields can originate in decoded event payloads.
+    labelled = read_asset_from_labels(alert)
+    if labelled:
+        return labelled
+
+    warning_key = (agent_id, agent_name)
+    if warned_missing is None or warning_key not in warned_missing:
+        logging.warning("No asset metadata for agent.id=%s agent.name=%s. Defaulting to Medium.", agent_id, agent_name)
+        if warned_missing is not None:
+            warned_missing.add(warning_key)
     return {
         "value": 3,
         "category": "Medium",
@@ -592,12 +814,12 @@ def make_id(case_key: str) -> str:
 
 def build_query(config: Dict[str, Any], gte: str, lte: str, upper_inclusive: bool = True) -> Dict[str, Any]:
     upper_op = "lte" if upper_inclusive else "lt"
-    must = [{"range": {"timestamp": {"gte": gte, upper_op: lte}}}]
+    filters = [{"range": {"timestamp": {"gte": gte, upper_op: lte}}}]
     must_not = []
 
     min_level = config.get("min_rule_level")
     if min_level is not None:
-        must.append({"range": {"rule.level": {"gte": int(min_level)}}})
+        filters.append({"range": {"rule.level": {"gte": int(min_level)}}})
 
     excluded_rule_ids = [str(x) for x in config.get("excluded_rule_ids", [])]
     if excluded_rule_ids:
@@ -607,56 +829,163 @@ def build_query(config: Dict[str, Any], gte: str, lte: str, upper_inclusive: boo
     if excluded_groups:
         must_not.append({"terms": {"rule.groups": excluded_groups}})
 
-    return {"bool": {"must": must, "must_not": must_not}}
+    return {"bool": {"filter": filters, "must_not": must_not}}
+
+
+def configured_source_includes(config: Dict[str, Any]) -> List[str]:
+    configured = config.get("source_includes", [])
+    if configured is None:
+        configured = []
+    if not isinstance(configured, list) or any(not isinstance(item, str) or not item.strip() for item in configured):
+        raise RuntimeError("source_includes must be an array of non-empty field names")
+    return sorted(set(DEFAULT_SOURCE_INCLUDES).union(item.strip() for item in configured))
+
+
+def source_index_for_window(
+    config: Dict[str, Any],
+    gte: str,
+    lte: str,
+    upper_inclusive: bool = False,
+) -> str:
+    pattern = str(config.get("source_index", "wazuh-alerts-4.x-{date}")).strip()
+    if "{date}" not in pattern:
+        return pattern
+    start = parse_dt(gte)
+    end = parse_dt(lte)
+    if start is None or end is None:
+        raise RuntimeError(f"Cannot resolve source index for invalid window: {gte} .. {lte}")
+    start = start.astimezone(dt.timezone.utc)
+    end = end.astimezone(dt.timezone.utc)
+    if end < start or (end == start and not upper_inclusive):
+        raise RuntimeError(f"Cannot resolve source index for empty or reversed window: {gte} .. {lte}")
+    effective_end = end if upper_inclusive else end - dt.timedelta(microseconds=1)
+    names: List[str] = []
+    cursor = start.date()
+    last_date = effective_end.date()
+    while cursor <= last_date:
+        names.append(pattern.replace("{date}", cursor.strftime("%Y.%m.%d")))
+        cursor += dt.timedelta(days=1)
+    return ",".join(names)
+
+
+def exact_total_hits(response: Dict[str, Any], context: str) -> int:
+    hits = response.get("hits")
+    if not isinstance(hits, dict):
+        raise RuntimeError(f"OpenSearch returned malformed hits during {context}")
+    total = hits.get("total")
+    if isinstance(total, int):
+        return total
+    if isinstance(total, dict):
+        relation = total.get("relation", "eq")
+        value = total.get("value")
+        if relation != "eq" or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"OpenSearch did not return an exact hit total during {context}: {total}")
+        return value
+    raise RuntimeError(f"OpenSearch omitted the exact hit total during {context}")
 
 
 def fetch_alerts(client: OpenSearchClient, config: Dict[str, Any], gte: str, lte: str, upper_inclusive: bool = True) -> Iterable[Tuple[str, str, Dict[str, Any]]]:
+    max_alerts = int(config.get("max_alerts_per_bucket", config.get("max_alerts_per_run", 100000)))
+    request_timeout = int(config.get("timeout", 60))
     body = {
         "size": int(config.get("page_size", 1000)),
         "query": build_query(config, gte, lte, upper_inclusive),
-        "sort": [{"timestamp": {"order": "asc"}}],
-        "_source": True,
+        "sort": ["_doc"],
+        # Exact below the guard, early lower-bound once the guard is exceeded.
+        # This avoids counting millions of matches merely to reject the bucket.
+        "track_total_hits": max_alerts + 1 if max_alerts > 0 else True,
+        "timeout": f"{max(1, request_timeout - 5)}s",
+        "_source": {"includes": configured_source_includes(config)},
     }
     keepalive = config.get("scroll_keepalive", "2m")
-    max_alerts = int(config.get("max_alerts_per_run", 50000))
     emitted = 0
-    response = client.search(config.get("source_index", "wazuh-alerts-*"), body, {"scroll": keepalive})
+    source_index = source_index_for_window(config, gte, lte, upper_inclusive)
+    response = client.search(
+        source_index,
+        body,
+        {"scroll": keepalive, "ignore_unavailable": "true", "allow_no_indices": "true"},
+    )
     validate_search_response(response, "initial alert search")
     scroll_id = response.get("_scroll_id")
 
     try:
-        while True:
-            hits = response.get("hits", {}).get("hits", [])
+        shards = response.get("_shards", {})
+        resolved_shards = to_int(shards.get("total"), 0) if isinstance(shards, dict) else 0
+        if resolved_shards < 1:
+            raise RuntimeError(
+                f"No concrete Wazuh alert index resolved for source={source_index}; "
+                "bucket aborted so an empty snapshot cannot advance the checkpoint"
+            )
+        total_value = response.get("hits", {}).get("total")
+        if isinstance(total_value, dict) and total_value.get("relation") == "gte":
+            lower_bound = total_value.get("value")
+            if isinstance(lower_bound, int) and max_alerts > 0 and lower_bound > max_alerts:
+                raise RuntimeError(
+                    f"max_alerts_per_bucket exceeded (at least {lower_bound}>{max_alerts}); "
+                    f"bucket aborted before any write for gte={gte} "
+                    f"{'lte' if upper_inclusive else 'lt'}={lte}"
+                )
+        expected = exact_total_hits(response, "initial alert search")
+        if max_alerts > 0 and expected > max_alerts:
+            raise RuntimeError(
+                f"max_alerts_per_bucket exceeded ({expected}>{max_alerts}); bucket aborted before any write "
+                f"for gte={gte} {'lte' if upper_inclusive else 'lt'}={lte}"
+            )
+        while emitted < expected:
+            hits = response.get("hits", {}).get("hits")
+            if not isinstance(hits, list):
+                raise RuntimeError("OpenSearch returned malformed alert hits")
             if not hits:
-                break
+                raise RuntimeError(
+                    f"Incomplete scroll: expected {expected} alerts but received {emitted} for gte={gte} lt/lte={lte}"
+                )
             for hit in hits:
-                if max_alerts > 0 and emitted >= max_alerts:
-                    message = (
-                        f"max_alerts_per_run reached ({max_alerts}); run aborted before writing partial aggregates "
-                        f"for gte={gte} {'lte' if upper_inclusive else 'lt'}={lte}"
-                    )
-                    logging.error(
-                        message
-                    )
-                    raise RuntimeError(message)
+                if not isinstance(hit, dict) or not isinstance(hit.get("_source"), dict):
+                    raise RuntimeError("OpenSearch returned an alert hit without a valid _source")
                 emitted += 1
                 yield hit.get("_index", ""), hit.get("_id", ""), hit.get("_source", {})
-            if not scroll_id:
+            if emitted > expected:
+                raise RuntimeError(
+                    f"Scroll returned more alerts than its exact total ({emitted}>{expected}) for gte={gte} lt/lte={lte}"
+                )
+            if emitted == expected:
                 break
+            if not scroll_id:
+                raise RuntimeError(
+                    f"Incomplete scroll: cursor missing after {emitted}/{expected} alerts for gte={gte} lt/lte={lte}"
+                )
             response = client.scroll(scroll_id, keepalive)
             validate_search_response(response, "alert scroll")
-            scroll_id = response.get("_scroll_id", scroll_id)
+            next_scroll_id = response.get("_scroll_id")
+            if not next_scroll_id:
+                raise RuntimeError(
+                    f"Incomplete scroll: continuation cursor missing after {emitted}/{expected} alerts"
+                )
+            scroll_id = next_scroll_id
+        if emitted != expected:
+            raise RuntimeError(f"Incomplete scroll: expected {expected} alerts but emitted {emitted}")
+        logging.info(
+            "Raw snapshot read complete: processed=%d expected=%d source=%s gte=%s %s=%s",
+            emitted,
+            expected,
+            source_index,
+            gte,
+            "lte" if upper_inclusive else "lt",
+            lte,
+        )
     finally:
         if scroll_id:
             client.clear_scroll(scroll_id)
 
 
 def count_values(counter: collections.Counter, limit: int) -> List[Dict[str, Any]]:
-    return [{"value": str(k), "count": int(v)} for k, v in counter.most_common(limit)]
+    ordered = sorted(counter.items(), key=lambda item: (-int(item[1]), str(item[0])))
+    return [{"value": str(k), "count": int(v)} for k, v in ordered[:limit]]
 
 
 def sample_values(counter: collections.Counter, limit: int) -> List[str]:
-    return [str(k) for k, _ in counter.most_common(limit)]
+    ordered = sorted(counter.items(), key=lambda item: (-int(item[1]), str(item[0])))
+    return [str(k) for k, _ in ordered[:limit]]
 
 
 def weighted_median(counter: collections.Counter) -> int:
@@ -677,7 +1006,8 @@ def select_rule_level(counter: collections.Counter, strategy: str) -> int:
         return 0
     strategy = str(strategy or "max").lower()
     if strategy == "mode":
-        return int(counter.most_common(1)[0][0])
+        highest_frequency = max(counter.values())
+        return int(max(value for value, count in counter.items() if count == highest_frequency))
     if strategy == "median":
         return weighted_median(counter)
     return int(max(counter.keys()))
@@ -688,9 +1018,12 @@ def rule_level_counts(counter: collections.Counter) -> List[Dict[str, int]]:
 
 
 def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    validate_assets(assets)
     buckets: Dict[str, Dict[str, Any]] = {}
     bucket_minutes = int(config.get("bucket_minutes", 60))
+    max_cases = int(config.get("max_cases_per_bucket", 20000))
     skipped = 0
+    warned_missing_assets: set = set()
 
     for source_index, doc_id, alert in alerts:
         errors = required_alert_errors(alert)
@@ -711,6 +1044,12 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
         case_key, mode, key_fields = build_case_key(alert, observed, bucket_iso, config)
 
         if case_key not in buckets:
+            if len(buckets) >= max_cases:
+                raise RuntimeError(
+                    f"max_cases_per_bucket exceeded ({len(buckets) + 1}>{max_cases}); "
+                    "snapshot aborted before state writes. Review deduplication mode/noisy rules or "
+                    "raise the limit only after a measured load test."
+                )
             buckets[case_key] = {
                 "case_key": case_key,
                 "deduplication_mode": mode,
@@ -723,10 +1062,11 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
                 "sample_source_index": source_index,
                 "sample_document_id": doc_id,
                 "sample_alert": alert,
+                "sample_sort_key": (ts, str(source_index), str(doc_id)),
                 "case_type": classify_case_type(alert),
                 "max_rule_level": to_int(first_value(alert, ["rule.level"], 0), 0),
                 "rule_levels": collections.Counter(),
-                "asset": get_asset(alert, assets),
+                "asset": get_asset(alert, assets, warned_missing_assets),
                 "srcip": collections.Counter(),
                 "dstip": collections.Counter(),
                 "dstport": collections.Counter(),
@@ -744,6 +1084,14 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
         bucket["event_count"] += 1
         bucket["first_seen"] = min(bucket["first_seen"], ts)
         bucket["last_seen"] = max(bucket["last_seen"], ts)
+        sample_sort_key = (ts, str(source_index), str(doc_id))
+        if sample_sort_key < bucket["sample_sort_key"]:
+            bucket["sample_sort_key"] = sample_sort_key
+            bucket["sample_source_index"] = source_index
+            bucket["sample_document_id"] = doc_id
+            bucket["sample_alert"] = alert
+            bucket["case_type"] = classify_case_type(alert)
+            bucket["asset"] = get_asset(alert, assets, warned_missing_assets)
         current_rule_level = to_int(first_value(alert, ["rule.level"], 0), 0)
         bucket["max_rule_level"] = max(bucket["max_rule_level"], current_rule_level)
         bucket["rule_levels"][current_rule_level] += 1
@@ -754,7 +1102,10 @@ def aggregate(alerts: Iterable[Tuple[str, str, Dict[str, Any]]], assets: Dict[st
                 bucket[field][value] += 1
 
     if skipped:
-        logging.warning("Skipped malformed alerts: %d (details limited to first 10)", skipped)
+        raise RuntimeError(
+            f"Bucket contains {skipped} malformed alert(s); snapshot aborted before state writes "
+            "(details logged for the first 10)"
+        )
     return buckets
 
 
@@ -827,7 +1178,8 @@ def build_doc(bucket: Dict[str, Any], config: Dict[str, Any], existing_doc: Opti
             "case_key": bucket["case_key"],
             "deduplication_mode": bucket["deduplication_mode"],
             "case_type": bucket["case_type"],
-            "status": "open",
+            # Bucket lifecycle only; this is not an analyst incident workflow status.
+            "status": str(bucket.get("lifecycle_status", "open")),
             "dedup_key_fields": bucket["dedup_key_fields"],
             "bucket_start": bucket["bucket_start"],
             "bucket_size": bucket_size_label(int(bucket["bucket_minutes"])),
@@ -966,6 +1318,319 @@ def build_escalation_doc(state_doc: Dict[str, Any]) -> Tuple[str, Dict[str, Any]
         },
     }
     return event_id, doc
+
+
+def chunked(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for offset in range(0, len(items), size):
+        yield items[offset:offset + size]
+
+
+def load_existing_states(
+    client: OpenSearchClient,
+    references: List[Tuple[str, str]],
+    config: Dict[str, Any],
+) -> Dict[Tuple[str, str], Optional[Dict[str, Any]]]:
+    unique_references = sorted(set(references))
+    batch_size = int(config.get("mget_batch_size", 1000))
+    retry_attempts = int(config.get("retry_attempts", 4))
+    retry_backoff = float(config.get("retry_backoff_seconds", 1.0))
+    states: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    by_index: Dict[str, List[str]] = collections.defaultdict(list)
+    for index, doc_id in unique_references:
+        by_index[index].append(doc_id)
+
+    for index in sorted(by_index):
+        for id_batch in chunked(by_index[index], batch_size):
+            pending_ids = list(id_batch)
+            for attempt in range(1, retry_attempts + 1):
+                batch = [(index, doc_id) for doc_id in pending_ids]
+                requested = set(batch)
+                try:
+                    response = client.mget(index, pending_ids)
+                except OpenSearchHTTPError as exc:
+                    if exc.status == 404 and "index_not_found_exception" in exc.body:
+                        for key in batch:
+                            states[key] = None
+                        pending_ids = []
+                        break
+                    raise
+                returned = response.get("docs")
+                if not isinstance(returned, list) or len(returned) != len(batch):
+                    raise RuntimeError(
+                        f"Malformed _mget response: expected {len(batch)} items, received "
+                        f"{len(returned) if isinstance(returned, list) else 'non-array'}"
+                    )
+                seen = set()
+                retry_ids: List[str] = []
+                for item in returned:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("Malformed _mget response item")
+                    key = (str(item.get("_index", "")), str(item.get("_id", "")))
+                    if key not in requested or key in seen:
+                        raise RuntimeError(f"Unexpected or duplicate _mget response item: {key}")
+                    seen.add(key)
+                    error = item.get("error")
+                    if error:
+                        status = to_int(item.get("status"), 0)
+                        error_type = error.get("type") if isinstance(error, dict) else None
+                        if status == 404 and error_type == "index_not_found_exception":
+                            states[key] = None
+                            continue
+                        if status in BULK_RETRYABLE_STATUSES and attempt < retry_attempts:
+                            retry_ids.append(key[1])
+                            continue
+                        raise RuntimeError(f"_mget failed for index={key[0]} id={key[1]}: {error}")
+                    if item.get("found") is False:
+                        states[key] = None
+                        continue
+                    if item.get("found") is not True or not isinstance(item.get("_source"), dict):
+                        raise RuntimeError(f"Malformed _mget document for index={key[0]} id={key[1]}")
+                    states[key] = item["_source"]
+                if seen != requested:
+                    raise RuntimeError(f"_mget omitted {len(requested - seen)} requested document(s)")
+                if not retry_ids:
+                    pending_ids = []
+                    break
+                delay = retry_backoff * (2 ** (attempt - 1))
+                delay += random.uniform(0, min(1.0, delay * 0.25)) if delay else 0.0
+                logging.warning(
+                    "Retrying %d failed _mget item(s) after %.2fs (attempt %d/%d)",
+                    len(retry_ids),
+                    delay,
+                    attempt + 1,
+                    retry_attempts,
+                )
+                time.sleep(delay)
+                pending_ids = retry_ids
+            if pending_ids:
+                raise RuntimeError(f"_mget exhausted retries for {len(pending_ids)} document(s) in {index}")
+    return states
+
+
+def bulk_operation_key(operation: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        str(operation["action"]),
+        str(operation["index"]),
+        str(operation["id"]),
+    )
+
+
+def encode_bulk_operation(operation: Dict[str, Any]) -> bytes:
+    cached = operation.get("_encoded")
+    if isinstance(cached, bytes):
+        return cached
+    action = str(operation["action"])
+    if action not in {"create", "index"}:
+        raise RuntimeError(f"Unsupported bulk action: {action}")
+    metadata = {action: {"_id": operation["id"]}}
+    metadata_line = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    document_line = json.dumps(operation["document"], ensure_ascii=False, separators=(",", ":"))
+    encoded = f"{metadata_line}\n{document_line}\n".encode("utf-8")
+    # Cache the exact NDJSON bytes. Retries then resend the same frozen
+    # snapshot and large documents are serialized only once per run.
+    operation["_encoded"] = encoded
+    return encoded
+
+
+def build_bulk_batches(operations: List[Dict[str, Any]], config: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    max_actions = int(config.get("bulk_max_actions", 1000))
+    max_bytes = int(config.get("bulk_max_bytes", 5 * 1024 * 1024))
+    batches: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_bytes = 0
+    keys = set()
+
+    for operation in operations:
+        key = bulk_operation_key(operation)
+        if key in keys:
+            raise RuntimeError(f"Duplicate bulk operation: action={key[0]} index={key[1]} id={key[2]}")
+        keys.add(key)
+        operation_bytes = len(encode_bulk_operation(operation))
+        if operation_bytes > max_bytes:
+            raise RuntimeError(
+                f"Bulk document exceeds bulk_max_bytes ({operation_bytes}>{max_bytes}): "
+                f"index={key[1]} id={key[2]}"
+            )
+        if current and (len(current) >= max_actions or current_bytes + operation_bytes > max_bytes):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(operation)
+        current_bytes += operation_bytes
+    if current:
+        batches.append(current)
+    return batches
+
+
+def parse_bulk_response(
+    response: Dict[str, Any],
+    operations: List[Dict[str, Any]],
+) -> Dict[Tuple[str, str, str], Tuple[int, Any]]:
+    items = response.get("items")
+    if not isinstance(items, list) or len(items) != len(operations):
+        raise RuntimeError(
+            f"Malformed _bulk response: expected {len(operations)} items, received "
+            f"{len(items) if isinstance(items, list) else 'non-array'}"
+        )
+    expected = {bulk_operation_key(operation) for operation in operations}
+    parsed: Dict[Tuple[str, str, str], Tuple[int, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict) or len(item) != 1:
+            raise RuntimeError("Malformed _bulk response item")
+        action, result = next(iter(item.items()))
+        if not isinstance(result, dict):
+            raise RuntimeError("Malformed _bulk action result")
+        key = (str(action), str(result.get("_index", "")), str(result.get("_id", "")))
+        status = result.get("status")
+        if key not in expected or key in parsed or not isinstance(status, int):
+            raise RuntimeError(f"Unexpected, duplicate, or malformed _bulk response item: {key}")
+        parsed[key] = (status, result.get("error"))
+    if set(parsed) != expected:
+        raise RuntimeError(f"_bulk response omitted {len(expected - set(parsed))} operation(s)")
+    return parsed
+
+
+def execute_bulk_operations(
+    client: OpenSearchClient,
+    operations: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Tuple[Dict[Tuple[str, str, str], int], Dict[Tuple[str, str, str], str]]:
+    accepted: Dict[Tuple[str, str, str], int] = {}
+    failures: Dict[Tuple[str, str, str], str] = {}
+    retry_attempts = int(config.get("retry_attempts", 4))
+    retry_backoff = float(config.get("retry_backoff_seconds", 1.0))
+    by_index: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for operation in operations:
+        by_index[str(operation["index"])].append(operation)
+
+    for index in sorted(by_index):
+        for batch in build_bulk_batches(by_index[index], config):
+            pending = list(batch)
+            for attempt in range(1, retry_attempts + 1):
+                payload = b"".join(encode_bulk_operation(operation) for operation in pending)
+                response = client.bulk(index, payload)
+                outcomes = parse_bulk_response(response, pending)
+                retry_operations: List[Dict[str, Any]] = []
+                for operation in pending:
+                    key = bulk_operation_key(operation)
+                    status, error = outcomes[key]
+                    if 200 <= status < 300 or (key[0] == "create" and status == 409):
+                        accepted[key] = status
+                    elif status in BULK_RETRYABLE_STATUSES and attempt < retry_attempts:
+                        retry_operations.append(operation)
+                    else:
+                        failures[key] = f"status={status} error={error}"
+                if not retry_operations:
+                    break
+                delay = retry_backoff * (2 ** (attempt - 1))
+                delay += random.uniform(0, min(1.0, delay * 0.25)) if delay else 0.0
+                logging.warning(
+                    "Retrying %d failed _bulk item(s) after %.2fs (attempt %d/%d)",
+                    len(retry_operations),
+                    delay,
+                    attempt + 1,
+                    retry_attempts,
+                )
+                time.sleep(delay)
+                pending = retry_operations
+    expected = {bulk_operation_key(operation) for operation in operations}
+    covered = set(accepted).union(failures)
+    if covered != expected or set(accepted).intersection(failures):
+        raise RuntimeError("Internal _bulk accounting error: not every operation has exactly one outcome")
+    return accepted, failures
+
+
+def format_bulk_failures(failures: Dict[Tuple[str, str, str], str]) -> str:
+    details = []
+    for (action, index, doc_id), error in sorted(failures.items()):
+        details.append(f"{action} {index}/{doc_id}: {error}")
+    return "; ".join(details[:20]) + (f"; ... {len(details) - 20} more" if len(details) > 20 else "")
+
+
+def process_bucket_rows_bulk(
+    client: OpenSearchClient,
+    config: Dict[str, Any],
+    bucket_rows: List[Tuple[str, str, Dict[str, Any]]],
+) -> int:
+    references = [(index, doc_id) for index, doc_id, _ in bucket_rows]
+    existing_states = load_existing_states(client, references, config)
+    state_operations: List[Dict[str, Any]] = []
+    escalation_operations: List[Dict[str, Any]] = []
+    escalation_for_state: Dict[Tuple[str, str, str], Tuple[str, str, str]] = {}
+
+    for destination_index, expected_doc_id, bucket in bucket_rows:
+        existing_doc = existing_states[(destination_index, expected_doc_id)]
+        doc_id, document = build_doc(bucket, config, existing_doc)
+        state_operation = {
+            "action": "index",
+            "index": destination_index,
+            "id": doc_id,
+            "document": document,
+        }
+        state_operations.append(state_operation)
+        state_key = bulk_operation_key(state_operation)
+        if document.get("risk", {}).get("escalation_log_required"):
+            escalation_id, escalation_document = build_escalation_doc(document)
+            escalation_operation = {
+                "action": "create",
+                "index": destination_index,
+                "id": escalation_id,
+                "document": escalation_document,
+            }
+            escalation_operations.append(escalation_operation)
+            escalation_for_state[state_key] = bulk_operation_key(escalation_operation)
+
+    # Validate both phases and all document sizes before the first write.
+    build_bulk_batches(escalation_operations, config)
+    build_bulk_batches(state_operations, config)
+
+    escalation_accepted, escalation_failures = execute_bulk_operations(
+        client, escalation_operations, config
+    )
+    safe_state_operations = []
+    for operation in state_operations:
+        state_key = bulk_operation_key(operation)
+        escalation_key = escalation_for_state.get(state_key)
+        if escalation_key is None or escalation_key in escalation_accepted:
+            safe_state_operations.append(operation)
+
+    state_accepted, state_failures = execute_bulk_operations(client, safe_state_operations, config)
+    all_failures = dict(escalation_failures)
+    all_failures.update(state_failures)
+    if all_failures:
+        raise RuntimeError(f"One or more _bulk items failed; checkpoint not advanced: {format_bulk_failures(all_failures)}")
+
+    created_events = sum(1 for status in escalation_accepted.values() if 200 <= status < 300)
+    return created_events + len(state_accepted)
+
+
+def process_buckets_bulk(
+    client: OpenSearchClient,
+    config: Dict[str, Any],
+    buckets: Dict[str, Dict[str, Any]],
+) -> int:
+    if not buckets:
+        return 0
+    bucket_rows: List[Tuple[str, str, Dict[str, Any]]] = []
+    for bucket in sorted(buckets.values(), key=lambda item: item["case_key"]):
+        destination_index = destination_index_for_bucket(config, bucket["bucket_start"])
+        doc_id = make_id(bucket["case_key"])
+        bucket_rows.append((destination_index, doc_id, bucket))
+
+    # Bound the additional memory used by materialized state/escalation JSON.
+    # A failed later batch leaves earlier deterministic writes safe to replay;
+    # the checkpoint still advances only after every batch succeeds.
+    processing_batch_size = max(
+        1,
+        min(
+            int(config.get("mget_batch_size", 1000)),
+            int(config.get("bulk_max_actions", 1000)),
+        ),
+    )
+    written = 0
+    for row_batch in chunked(bucket_rows, processing_batch_size):
+        written += process_bucket_rows_bulk(client, config, row_batch)
+    return written
 
 
 def template(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1159,7 +1824,204 @@ def template(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     }
 
 
+def stable_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def case_identity_hash(config: Dict[str, Any]) -> str:
+    return stable_hash(
+        {
+            "bucket_minutes": int(config.get("bucket_minutes", 60)),
+            "source_index": config.get("source_index", "wazuh-alerts-4.x-{date}"),
+            "min_rule_level": config.get("min_rule_level"),
+            "excluded_rule_ids": sorted(str(item) for item in config.get("excluded_rule_ids", [])),
+            "excluded_rule_groups": sorted(str(item) for item in config.get("excluded_rule_groups", [])),
+            "deduplication_mode": config.get("deduplication_mode", "coarse"),
+            "rule_overrides": config.get("rule_overrides", {}),
+            "destination_index_prefix": config.get("destination_index_prefix", "siem-alarm"),
+        }
+    )
+
+
+def scoring_config_hash(config: Dict[str, Any], assets: Dict[str, Any]) -> str:
+    return stable_hash(
+        {
+            "threat_level_strategy": config.get("threat_level_strategy", "max"),
+            "escalation_log_enabled": config.get("escalation_log_enabled", True),
+            "escalation_log_levels": sorted(str(item) for item in config.get("escalation_log_levels", [])),
+            "evidence_sample_limit": int(config.get("evidence_sample_limit", 20)),
+            "evidence_top_limit": int(config.get("evidence_top_limit", 10)),
+            "assets": assets,
+        }
+    )
+
+
+def load_checkpoint(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    path = str(config.get("checkpoint_file", "")).strip()
+    if not path or not os.path.exists(path):
+        return None
+    checkpoint = load_json(path, None)
+    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != 1:
+        raise RuntimeError(f"Invalid checkpoint schema: {path}")
+    marker = parse_dt(checkpoint.get("last_completed_bucket_end"))
+    bucket_minutes = int(config.get("bucket_minutes", 60))
+    if marker is None or marker != bucket_start(marker, bucket_minutes):
+        raise RuntimeError(f"Invalid or unaligned checkpoint marker: {path}")
+    expected_hash = case_identity_hash(config)
+    checkpoint_hash = checkpoint.get("case_identity_hash")
+    if checkpoint_hash != expected_hash:
+        raise RuntimeError(
+            "Checkpoint case identity does not match this configuration. Use a new destination prefix, "
+            "or complete a controlled migration/backfill before replacing the checkpoint."
+        )
+    return checkpoint
+
+
+def save_checkpoint(
+    config: Dict[str, Any],
+    marker: dt.datetime,
+    assets: Dict[str, Any],
+    run_metrics: Dict[str, Any],
+) -> None:
+    path = str(config.get("checkpoint_file", "")).strip()
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{path}.tmp.{os.getpid()}"
+    record = {
+        "schema_version": 1,
+        "last_completed_bucket_end": iso_z(marker),
+        "case_identity_hash": case_identity_hash(config),
+        "scoring_config_hash": scoring_config_hash(config, assets),
+        "updated_at": iso_z(utc_now()),
+        "last_run": run_metrics,
+    }
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def split_window(
+    start: dt.datetime,
+    end: dt.datetime,
+    bucket_minutes: int,
+    kind: str,
+) -> List[Dict[str, str]]:
+    windows: List[Dict[str, str]] = []
+    cursor = start.astimezone(dt.timezone.utc)
+    end = end.astimezone(dt.timezone.utc)
+    bucket_delta = dt.timedelta(minutes=bucket_minutes)
+    while cursor < end:
+        next_boundary = bucket_start(cursor, bucket_minutes) + bucket_delta
+        segment_end = min(end, next_boundary)
+        windows.append({"kind": kind, "gte": iso_z(cursor), "lte": iso_z(segment_end)})
+        cursor = segment_end
+    return windows
+
+
+def plan_run_windows(
+    config: Dict[str, Any],
+    now: Optional[dt.datetime] = None,
+    gte_override: Optional[str] = None,
+    lte_override: Optional[str] = None,
+) -> Tuple[List[Dict[str, str]], Optional[dt.datetime]]:
+    bucket_minutes = int(config.get("bucket_minutes", 60))
+    bucket_delta = dt.timedelta(minutes=bucket_minutes)
+    cutoff = (now or utc_now()).astimezone(dt.timezone.utc).replace(microsecond=0)
+    checkpoint_path = str(config.get("checkpoint_file", "")).strip()
+    checkpoint = load_checkpoint(config) if checkpoint_path else None
+
+    if gte_override:
+        start = parse_dt(gte_override)
+        end = parse_dt(lte_override) if lte_override else cutoff
+        if start is None or end is None or start >= end:
+            raise RuntimeError("Manual --from/--to window must be valid, timezone-aware, and increasing")
+        if start.astimezone(dt.timezone.utc) != bucket_start(start, bucket_minutes):
+            raise RuntimeError("Manual --from must align to an aggregation bucket boundary")
+        if lte_override and end.astimezone(dt.timezone.utc) != bucket_start(end, bucket_minutes):
+            raise RuntimeError("Manual --to must align to a bucket boundary; omit --to only for the current bucket")
+        return split_window(start, end, bucket_minutes, "manual"), None
+
+    if not bool(config.get("process_current_bucket_only", True)):
+        lookback = int(config.get("lookback_minutes", bucket_minutes))
+        start = bucket_start(cutoff - dt.timedelta(minutes=lookback), bucket_minutes)
+        windows = split_window(start, cutoff, bucket_minutes, "rolling")
+        return windows, None
+
+    current_start = bucket_start(cutoff, bucket_minutes)
+    windows: List[Dict[str, str]] = []
+    if current_start < cutoff:
+        windows.append({"kind": "current", "gte": iso_z(current_start), "lte": iso_z(cutoff)})
+
+    if not checkpoint_path:
+        return windows, None
+
+    finalization_delay = int(config.get("lookback_overlap_minutes", 7))
+    eligible_end = bucket_start(cutoff - dt.timedelta(minutes=finalization_delay), bucket_minutes)
+    if checkpoint:
+        cursor = parse_dt(checkpoint["last_completed_bucket_end"])
+        assert cursor is not None
+        if cursor > eligible_end:
+            raise RuntimeError(
+                f"Checkpoint marker {iso_z(cursor)} is ahead of eligible closed-bucket end {iso_z(eligible_end)}"
+            )
+    else:
+        # Bootstrap only the most recent finalized bucket; never replay an
+        # unbounded history merely because this is the first deployment.
+        cursor = eligible_end - bucket_delta
+
+    max_catchup = int(config.get("max_catchup_buckets_per_run", 2))
+    catchup_windows: List[Dict[str, str]] = []
+    while cursor < eligible_end and len(catchup_windows) < max_catchup:
+        catchup_windows.append(
+            {
+                "kind": "closed",
+                "gte": iso_z(cursor),
+                "lte": iso_z(cursor + bucket_delta),
+            }
+        )
+        cursor += bucket_delta
+    windows.extend(catchup_windows)
+    return windows, cursor
+
+
+def lifecycle_status_for_window(
+    window: Dict[str, str],
+    bucket_minutes: int,
+    now: Optional[dt.datetime] = None,
+) -> str:
+    if window.get("kind") == "closed":
+        return "finalized"
+    end = parse_dt(window.get("lte"))
+    cutoff = (now or utc_now()).astimezone(dt.timezone.utc)
+    if (
+        window.get("kind") in {"manual", "rolling"}
+        and end is not None
+        and end == bucket_start(end, bucket_minutes)
+        and end <= bucket_start(cutoff, bucket_minutes)
+    ):
+        return "finalized"
+    return "open"
+
+
 def run_once(config: Dict[str, Any], gte_override: Optional[str] = None, lte_override: Optional[str] = None) -> int:
+    run_started = time.monotonic()
     client = OpenSearchClient(
         config["opensearch_url"],
         config["username"],
@@ -1175,67 +2037,59 @@ def run_once(config: Dict[str, Any], gte_override: Optional[str] = None, lte_ove
         logging.info("Installing/updating index template: %s", config.get("template_name", "siem-alarm-template"))
         client.put_template(config.get("template_name", "siem-alarm-template"), template(config))
 
-    assets = load_json(config.get("assets_file", "/opt/wazuh-risk-scoring/assets.json"), {})
-    bucket_minutes = int(config.get("bucket_minutes", 60))
-    lookback_minutes = int(config.get("lookback_minutes", bucket_minutes))
-    lookback_overlap_minutes = int(config.get("lookback_overlap_minutes", 7))
-    if gte_override:
-        if not parse_dt(gte_override):
-            raise RuntimeError(f"Invalid --from datetime: {gte_override}")
-        if lte_override and not parse_dt(lte_override):
-            raise RuntimeError(f"Invalid --to datetime: {lte_override}")
-        gte = gte_override
-        lte = lte_override or iso_z(utc_now())
-        upper_inclusive = False
-        logging.info("Manual window override enabled: gte=%s lt=%s", gte, lte)
-    else:
-        now = utc_now()
-        current_bucket_start = bucket_start(now, bucket_minutes)
-        if bool(config.get("process_current_bucket_only", True)):
-            minutes_after_boundary = (now - current_bucket_start).total_seconds() / 60.0
-            if lookback_overlap_minutes > 0 and minutes_after_boundary <= lookback_overlap_minutes:
-                gte = iso_z(current_bucket_start - dt.timedelta(minutes=bucket_minutes))
-            else:
-                gte = iso_z(current_bucket_start)
-        else:
-            gte = iso_z(now - dt.timedelta(minutes=lookback_minutes))
-        lte = iso_z(now)
-        upper_inclusive = True
-
-    logging.info(
-        "Querying raw alerts from %s gte=%s %s=%s",
-        config.get("source_index", "wazuh-alerts-*"),
-        gte,
-        "lte" if upper_inclusive else "lt",
-        lte,
+    assets = load_asset_inventory(config.get("assets_file", "/opt/wazuh-risk-scoring/assets.json"))
+    windows, checkpoint_target = plan_run_windows(
+        config,
+        gte_override=gte_override,
+        lte_override=lte_override,
     )
-    alerts = fetch_alerts(client, config, gte, lte, upper_inclusive)
-    buckets = aggregate(alerts, assets, config)
-    logging.info("Aggregated buckets: %d", len(buckets))
-
     written = 0
-    destination_indices = set()
-    for bucket in buckets.values():
-        destination_index = destination_index_for_bucket(config, bucket["bucket_start"])
-        destination_indices.add(destination_index)
-        doc_id = make_id(bucket["case_key"])
-        existing_doc = client.get_doc(destination_index, doc_id)
-        doc_id, doc = build_doc(bucket, config, existing_doc)
-        if doc.get("risk", {}).get("escalation_log_required"):
-            escalation_id, escalation_doc = build_escalation_doc(doc)
-            created = client.create_doc_if_absent(destination_index, escalation_id, escalation_doc)
-            if created:
-                written += 1
-                logging.info("Created escalation document: %s", escalation_id)
-            else:
-                logging.info("Escalation document already exists: %s", escalation_id)
-        # State is written after the immutable escalation event. If this write
-        # fails, the next run retries the same deterministic escalation ID and
-        # then advances state without losing the event.
-        client.index_doc(destination_index, doc_id, doc)
-        written += 1
+    total_buckets = 0
+    lifecycle_now = utc_now()
+    for window in windows:
+        source_index = source_index_for_window(config, window["gte"], window["lte"], False)
+        logging.info(
+            "Processing %s snapshot source=%s gte=%s lt=%s",
+            window["kind"],
+            source_index,
+            window["gte"],
+            window["lte"],
+        )
+        alerts = fetch_alerts(client, config, window["gte"], window["lte"], False)
+        buckets = aggregate(alerts, assets, config)
+        lifecycle_status = lifecycle_status_for_window(
+            window,
+            int(config.get("bucket_minutes", 60)),
+            lifecycle_now,
+        )
+        for bucket in buckets.values():
+            bucket["lifecycle_status"] = lifecycle_status
+        total_buckets += len(buckets)
+        written += process_buckets_bulk(client, config, buckets)
+        logging.info("Completed %s snapshot: aggregate_buckets=%d", window["kind"], len(buckets))
 
-    logging.info("Written/updated documents: %d indices=%s", written, sorted(destination_indices))
+    if checkpoint_target is not None:
+        duration_seconds = round(time.monotonic() - run_started, 3)
+        save_checkpoint(
+            config,
+            checkpoint_target,
+            assets,
+            {
+                "windows": len(windows),
+                "aggregate_buckets": total_buckets,
+                "written_or_updated": written,
+                "duration_seconds": duration_seconds,
+                "completed": True,
+            },
+        )
+    duration_seconds = round(time.monotonic() - run_started, 3)
+    logging.info(
+        "Run complete: windows=%d aggregate_buckets=%d written_or_updated=%d duration_seconds=%.3f",
+        len(windows),
+        total_buckets,
+        written,
+        duration_seconds,
+    )
     return written
 
 
@@ -1247,6 +2101,11 @@ def load_config(path: str) -> Dict[str, Any]:
         if not config.get(key):
             raise RuntimeError(f"Missing required config key: {key}")
 
+    if str(config["username"]).lower() == "admin":
+        raise RuntimeError("Indexer admin is not allowed for runtime; use the dedicated siem_alarm_service user")
+    if "password" in config:
+        raise RuntimeError("Inline password is not allowed; use password_env and the protected EnvironmentFile")
+
     opensearch_url = str(config["opensearch_url"])
     if not opensearch_url.startswith("https://"):
         raise RuntimeError("opensearch_url must use https://")
@@ -1255,16 +2114,18 @@ def load_config(path: str) -> Dict[str, Any]:
     if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", password_env):
         raise RuntimeError("password_env must be a valid uppercase environment variable name")
 
-    password = config.get("password")
-    if not password or str(password).startswith(("GANTI_", "CHANGE_")):
-        password = os.environ.get(password_env)
+    password = os.environ.get(password_env)
     if not password or str(password).startswith(("GANTI_", "CHANGE_")):
         raise RuntimeError(
             f"Indexer password is missing; set environment variable {password_env} "
-            "or provide a non-placeholder password"
+            "through the protected EnvironmentFile"
         )
     config = dict(config)
     config["password"] = str(password)
+
+    if "max_alerts_per_bucket" not in config and "max_alerts_per_run" in config:
+        config["max_alerts_per_bucket"] = config["max_alerts_per_run"]
+        logging.warning("max_alerts_per_run is deprecated; use max_alerts_per_bucket")
 
     integer_defaults = {
         "timeout": 60,
@@ -1272,8 +2133,13 @@ def load_config(path: str) -> Dict[str, Any]:
         "bucket_minutes": 60,
         "lookback_minutes": 60,
         "lookback_overlap_minutes": 7,
-        "max_alerts_per_run": 50000,
+        "max_alerts_per_bucket": 100000,
+        "max_cases_per_bucket": 20000,
         "page_size": 1000,
+        "mget_batch_size": 1000,
+        "bulk_max_actions": 1000,
+        "bulk_max_bytes": 5 * 1024 * 1024,
+        "max_catchup_buckets_per_run": 2,
         "evidence_sample_limit": 20,
         "evidence_top_limit": 10,
     }
@@ -1283,8 +2149,13 @@ def load_config(path: str) -> Dict[str, Any]:
         "bucket_minutes": (1, 1440),
         "lookback_minutes": (1, 10080),
         "lookback_overlap_minutes": (0, 1440),
-        "max_alerts_per_run": (1, 10_000_000),
+        "max_alerts_per_bucket": (1, 10_000_000),
+        "max_cases_per_bucket": (1, 1_000_000),
         "page_size": (1, 10000),
+        "mget_batch_size": (1, 10000),
+        "bulk_max_actions": (1, 10000),
+        "bulk_max_bytes": (1024, 100 * 1024 * 1024),
+        "max_catchup_buckets_per_run": (1, 24),
         "evidence_sample_limit": (1, 1000),
         "evidence_top_limit": (1, 1000),
     }
@@ -1325,6 +2196,22 @@ def load_config(path: str) -> Dict[str, Any]:
         raise RuntimeError("destination_index_prefix must be lowercase and OpenSearch-safe")
     config["destination_index_prefix"] = prefix
 
+    source_index = str(config.get("source_index", "wazuh-alerts-4.x-{date}")).strip()
+    if not source_index or source_index.lower() != source_index:
+        raise RuntimeError("source_index must be non-empty and lowercase")
+    if source_index.count("{date}") != 1:
+        raise RuntimeError("source_index must contain exactly one {date} placeholder")
+    resolved_source = source_index.replace("{date}", "2026.08.24")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", resolved_source):
+        raise RuntimeError("source_index must resolve to one exact lowercase daily index name")
+    config["source_index"] = source_index
+    configured_source_includes(config)
+
+    scroll_keepalive = str(config.get("scroll_keepalive", "2m"))
+    if not re.fullmatch(r"[1-9][0-9]*(?:ms|s|m|h)", scroll_keepalive):
+        raise RuntimeError("scroll_keepalive must be a positive OpenSearch duration such as 2m")
+    config["scroll_keepalive"] = scroll_keepalive
+
     mode = str(config.get("deduplication_mode", "coarse"))
     allowed_modes = {"coarse", "target_aware", "target_port_aware", "file_aware"}
     if mode not in allowed_modes:
@@ -1362,18 +2249,23 @@ def load_config(path: str) -> Dict[str, Any]:
             min_rule_level = int(min_rule_level)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("min_rule_level must be null or an integer") from exc
-        if not 0 <= min_rule_level <= 15:
-            raise RuntimeError("min_rule_level must be between 0 and 15")
+        if not 0 <= min_rule_level <= 16:
+            raise RuntimeError("min_rule_level must be between 0 and 16")
         config["min_rule_level"] = min_rule_level
 
     for key in ["excluded_rule_ids", "excluded_rule_groups"]:
         if not isinstance(config.get(key, []), list):
             raise RuntimeError(f"{key} must be an array")
 
-    for key in ["log_file", "assets_file", "lock_file"]:
+    for key in ["log_file", "assets_file", "lock_file", "checkpoint_file"]:
         value = str(config.get(key, ""))
         if value and not os.path.isabs(value):
             raise RuntimeError(f"{key} must be an absolute path")
+        if value:
+            config[key] = value
+
+    if config["process_current_bucket_only"] and not str(config.get("checkpoint_file", "")).strip():
+        logging.warning("checkpoint_file is not configured; bounded outage catch-up is disabled")
 
     if not config["verify_ssl"]:
         raise RuntimeError("verify_ssl=false is not allowed; Wazuh Indexer TLS verification is mandatory")
@@ -1398,7 +2290,23 @@ def main() -> int:
         action="store_true",
         help="Install/update the destination index template and exit",
     )
+    parser.add_argument(
+        "--validate-assets-only",
+        metavar="PATH",
+        help="Validate an assets.json file without connecting to the Indexer",
+    )
     args = parser.parse_args()
+
+    if args.validate_assets_only:
+        if args.once or args.loop or args.from_time or args.to_time or args.install_template_only:
+            parser.error("--validate-assets-only cannot be combined with runtime actions")
+        try:
+            assets = load_asset_inventory(args.validate_assets_only)
+            print(f"[+] Asset inventory valid: {args.validate_assets_only} ({len(assets)} entries)")
+            return 0
+        except Exception as exc:
+            print(f"[!] Asset inventory invalid: {exc}", file=sys.stderr)
+            return 1
 
     config = load_config(args.config)
     setup_logging(config.get("log_file", "/opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log"), config.get("log_level", "INFO"))

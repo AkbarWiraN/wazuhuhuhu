@@ -1,6 +1,6 @@
 # FINAL CHECKLIST Implementasi `siem-alarm-*` di Wazuh 4.14.7 AIO
 
-> **Versi 4.1** — Wazuh 4.14.7 compatibility + Production-hardened Progressive Alarm
+> **Versi 5.1** — Wazuh 4.14.7 compatibility + Production-hardened Snapshot-Bulk V2
 > Timer: 5 menit | Bucket: 1 jam | Log eskalasi: dokumen baru saat risk.level masuk Medium/High/Critical atau naik
 
 ---
@@ -17,11 +17,15 @@ agent.id + rule.id + timestamp_bucket_1h
 ```
 
 - Script jalan **setiap 5 menit**, bucket tetap **1 jam**.
+- Bucket current dihitung ulang setiap run; bucket tertutup menjadi eligible setelah delay default tujuh menit dan difinalisasi **sekali dan terpisah** pada tick timer berikutnya (normalnya sekitar boundary +10 menit untuk timer 5 menit). Tidak ada lagi window gabungan previous+current.
+- Source default `wazuh-alerts-4.x-{date}` diekspansi ke index harian UTC yang relevan, bukan fan-out ke seluruh history.
+- State lama dibaca melalui `/{index}/_mget`; escalation create-only dan alarm state ditulis melalui dua fase `/{index}/_bulk` yang dibatasi jumlah action dan byte. Operasi dikelompokkan per concrete destination index dan tidak membawa `_index` eksplisit di payload.
+- Checkpoint atomik default `/var/lib/wazuh-risk-scoring/checkpoint.json` membatasi recovery maksimal dua bucket per run tanpa membuat buffer raw alert baru.
 - `alarm.id` dibuat deterministik dari hash `case_key` → update, bukan duplikasi.
 - Log eskalasi dibuat secara **create-only sebelum state di-update** saat risk.level pertama kali masuk Medium/High/Critical atau naik ke level lebih tinggi.
 - Satu host hanya boleh menjalankan satu proses scoring; lock default: `/opt/wazuh-risk-scoring/logs/scoring.lock`.
 - TLS verification wajib untuk production menggunakan salinan Wazuh root CA.
-- Runtime memakai user Linux dan user Wazuh Indexer khusus `siem-alarm`, bukan `root`/`admin`.
+- Runtime memakai user Linux `siem-alarm` dan user Wazuh Indexer `siem_alarm_service`, bukan `root`/`admin`.
 - Field `srcip`, `dstip`, `dstport`, `proto`, `url`, `user`, `file_path`, `hash`, `CVE`, SCA = **evidence**, bukan pemecah case.
 
 ### 0.1 Baseline kompatibilitas 4.14.7
@@ -124,7 +128,8 @@ target_observed.proto_samples
 ```text
 coarse      = default (agent.id + rule.id + bucket_1h)
 target_aware = agent.id + rule.id + dstip + bucket_1h
-smart        = rule-specific, misal FIM pakai syscheck.path
+  target_port_aware = agent.id + rule.id + dstip + dstport + bucket_1h
+  file_aware        = agent.id + rule.id + syscheck.path + bucket_1h
 ```
 
 Gunakan mode lanjutan hanya jika SOC menilai default terlalu kasar untuk rule tertentu.
@@ -144,7 +149,7 @@ Tiga field ini harus selalu sama nilainya:
 source.raw_alert_count = alarm.event_count = risk.frequency_count_1h
 ```
 
-Nilai ini **bertambah setiap kali script jalan** selama bucket masih berjalan.
+Nilai ini dihitung ulang secara eksak dari raw evidence dan biasanya **bertambah setiap kali script jalan** selama bucket masih berjalan. Engine tidak menambah counter incremental, sehingga retry tidak menggandakan count.
 
 Perbedaan penting:
 
@@ -212,30 +217,36 @@ Risk Score = (Asset Value + Threat Level + Frequency Score) / 3
 ### 5.1 Prioritas sumber
 
 ```text
-1. Agent labels dari alert Wazuh
-2. assets.json
+1. assets.json milik root: lookup agent.id, lalu agent.name
+2. Agent labels resmi Wazuh di agent.labels.* hanya sebagai fallback
 3. Default = Medium (3)
 ```
+
+Urutan ini disengaja: inventori `root:siem-alarm` tidak boleh dikalahkan oleh label lokal dari endpoint. Field root `labels.asset.*` atau `asset.*` dari decoder/log payload tidak dipercaya. `assets.json` wajib memakai nilai integer `1` sampai `5`; kategori harus sesuai dan schema divalidasi fail-closed. Installer baru membuat runtime inventory kosong `{}`, bukan menyalin ID contoh `001`–`004`.
 
 ### 5.2 Label yang direkomendasikan
 
 ```xml
-<labels>
-  <label key="asset.value">5</label>
-  <label key="asset.category">Critical</label>
-  <label key="asset.type">Database Server</label>
-  <label key="asset.owner">Diskominfo</label>
-  <label key="asset.environment">Production</label>
-</labels>
+<ossec_config>
+  <labels>
+    <label key="asset.value">5</label>
+    <label key="asset.category">Critical</label>
+    <label key="asset.type">Database Server</label>
+    <label key="asset.owner">Diskominfo</label>
+    <label key="asset.environment">Production</label>
+  </labels>
+</ossec_config>
 ```
+
+Untuk production 5–25 agent, metode utama adalah `assets.json`; label dipakai hanya bila memang ingin metadata ikut melekat pada raw alert. Konfigurasi label terpusat harus dibungkus `<agent_config>` di `agent.conf` dan divalidasi dengan `/var/ossec/bin/verify-agent-conf` sebelum diaktifkan.
 
 ### 5.3 Validasi label
 
 ```json
-GET wazuh-alerts-*/_search
+GET wazuh-alerts-4.x-2026.05.22/_search
 {
   "size": 5,
-  "_source": ["timestamp", "agent", "agent.labels", "labels", "asset", "rule"],
+  "_source": ["timestamp", "agent.id", "agent.name", "agent.labels", "rule"],
   "sort": [{ "timestamp": { "order": "desc" } }]
 }
 ```
@@ -256,7 +267,7 @@ Contoh dokumen dengan progressive alarm state:
     "id": "a3f9c2b1d4e8...",
     "case_key": "coarse|003|2010935|2026-05-22T10:00:00Z",
     "deduplication_mode": "coarse",
-    "case_type": "coarse_rule_agent",
+    "case_type": "network",
     "status": "open",
     "dedup_key_fields": ["agent.id", "rule.id", "timestamp_bucket_1h"],
     "bucket_start": "2026-05-22T10:00:00Z",
@@ -295,7 +306,7 @@ Contoh dokumen dengan progressive alarm state:
     "type": "Firewall/IDS Sensor",
     "owner": "Diskominfo",
     "environment": "Production",
-    "source": "agent_label"
+    "source": "assets_json"
   },
   "risk": {
     "asset_value": 5,
@@ -315,7 +326,7 @@ Contoh dokumen dengan progressive alarm state:
     "formula": "(A+B+C)/3"
   },
   "source": {
-    "index": "wazuh-alerts-*",
+    "index": "wazuh-alerts-4.x-2026.05.22",
     "raw_alert_count": 510,
     "sample_document_id": "abc123"
   },
@@ -379,6 +390,8 @@ Contoh dokumen log eskalasi yang dibuat saat level naik:
 | `alarm_state` | State agregasi utama | Di-update dengan `alarm.id` yang sama |
 | `alarm_escalation` | Log event untuk aplikasi eksternal | Dokumen baru saat level pertama kali eligible atau naik |
 
+`alarm.status` adalah lifecycle bucket, bukan status penanganan insiden: `open` untuk bucket berjalan dan `finalized` setelah snapshot bucket tertutup berhasil ditulis. Jangan memakainya sebagai field acknowledge/resolve analyst.
+
 ### 6.2 Penjelasan field risk baru
 
 | Field | Tipe | Keterangan |
@@ -394,8 +407,8 @@ Contoh dokumen log eskalasi yang dibuat saat level naik:
 ```text
 alarm.id = sha256(case_key)
 
-Script menggunakan:
-  PUT siem-alarm-*/_doc/<alarm.id>
+Script menggunakan action `index` dengan ID deterministik di fase `_bulk` state:
+  POST siem-alarm-YYYY.MM.DD/_bulk
 
 Karena document ID sama → dokumen yang ada di-UPDATE, bukan INSERT baru.
 Tidak ada duplikasi dokumen untuk case_key yang sama dalam satu bucket.
@@ -427,10 +440,13 @@ Installer wajib dijalankan dari paket lengkap, tetapi tidak bergantung pada curr
 - Memastikan paket Wazuh tepat `4.14.7`, Filebeat tepat `7.10.2`, seluruh service AIO aktif, certificate chain valid, dan `filebeat test output` berhasil.
 - Memvalidasi seluruh Python/JSON dan menjalankan automated unit tests sebelum mengubah `/opt` atau systemd.
 - Membuat user/group Linux `siem-alarm`.
+- Membuat state directory terproteksi `/var/lib/wazuh-risk-scoring` untuk checkpoint lokal; raw alert tidak pernah disalin ke sana.
 - Menyalin Wazuh CA dari `/etc/wazuh-indexer/certs/root-ca.pem`.
-- Membuat backup file lama di `/opt/wazuh-risk-scoring/backups/<UTC timestamp>`.
+- Membuat backup mode root-only untuk source lama, config, assets, environment secret, CA, checkpoint, dan unit di `/opt/wazuh-risk-scoring/backups/<UTC timestamp>`.
 - Mempertahankan config, assets, dan environment file yang sudah ada.
-- Memasang service, timer, dan logrotate tetapi **tidak meng-enable timer**.
+- Pada instalasi baru, membuat `assets.json` kosong (`{}`); data `assets.example.json` tidak pernah dijadikan inventory production otomatis.
+- Menolak symlink pada source/target terkelola dan memvalidasi schema inventory aset sebelum timer lama dihentikan.
+- Memasang service, failure handler, timer, dan logrotate tetapi **tidak meng-enable timer**.
 - Menjalankan `systemd-analyze verify`.
 
 Jika CA atau sertifikat node Indexer berada di lokasi lain:
@@ -453,7 +469,9 @@ sudo \
 /opt/wazuh-risk-scoring/assets.json
 /opt/wazuh-risk-scoring/root-ca.pem
 /etc/wazuh-risk-scoring/siem-alarm.env
+/var/lib/wazuh-risk-scoring/checkpoint.json (dibuat atomik oleh engine pada run sukses)
 /etc/systemd/system/siem-alarm-scoring.service
+/etc/systemd/system/siem-alarm-scoring-failure@.service
 /etc/systemd/system/siem-alarm-scoring.timer
 /etc/logrotate.d/siem-alarm-scoring
 ```
@@ -479,13 +497,16 @@ Sebelum test, buka **Indexer Management → Security** sebagai administrator:
 
 1. Pada **Internal users**, buat user `siem_alarm_service` dengan password unik.
 2. Pada **Roles**, buat role `siem_alarm_runtime` dengan:
-   - Cluster permissions: `cluster_composite_ops_ro`—dibutuhkan untuk operasi scroll/clear-scroll.
+   - Cluster permissions: `cluster_composite_ops_ro`—dibutuhkan untuk `_mget` serta operasi scroll/clear-scroll.
+   - Cluster permission individual: `indices:data/write/bulk*`—Bulk API dievaluasi juga pada scope cluster.
    - Index pattern `wazuh-alerts-*`: allowed action `read`.
    - Index pattern `siem-alarm-*`: allowed actions `read`, `index`, dan `create_index`.
    - Tenant permissions: kosong.
 3. Pada tab **Mapped users** role tersebut, map `siem_alarm_service`.
 
-Hak `read` pada `siem-alarm-*` diperlukan karena engine membaca state lama sebelum progressive update. Jangan memberikan `indices_all`, akses Security API, system index, atau index Wazuh lain. Template dan ISM policy dipasang satu kali menggunakan administrator; runtime account tidak memerlukan cluster-admin.
+Hak `read` pada `siem-alarm-*` diperlukan karena engine membaca state lama melalui endpoint per-index `_mget`. Action group index `index` mencakup operasi index/create di dalam bulk, sedangkan permission cluster individual `indices:data/write/bulk*` mengizinkan envelope Bulk API walaupun endpoint-nya per-index. Request dikelompokkan per destination index dan tidak memakai global `/_mget`/`/_bulk` dengan `_index` eksplisit, sehingga tetap kompatibel dengan cluster yang menonaktifkan `rest.action.multi.allow_explicit_index`. Jangan menggantinya dengan `cluster_composite_ops`, karena action group tersebut juga memberi reindex dan pengelolaan alias yang tidak diperlukan. Jangan memberikan `indices_all`, akses Security API, system index, atau index Wazuh lain. Template dan ISM policy dipasang satu kali menggunakan administrator; runtime account tidak memerlukan cluster-admin.
+
+Rujukan permission: [OpenSearch default action groups](https://docs.opensearch.org/latest/security/access-control/default-action-groups/) dan [Bulk API required permissions](https://docs.opensearch.org/latest/api-reference/document-apis/bulk/). Tetap lakukan preflight dengan user production pada Indexer 4.14.7; respons bulk harus diperiksa per item, bukan hanya HTTP status.
 
 Gunakan input password interaktif dan verifikasi CA. Jangan memasukkan password ke argumen command.
 
@@ -502,12 +523,15 @@ sudo curl --fail --silent --show-error \
 ### 8.3 Cek raw alert
 
 ```bash
+ALERT_INDEX_DATE="$(date -u +%Y.%m.%d)"
 sudo curl --fail --silent --show-error \
   --connect-timeout 10 --max-time 60 \
   --cacert /opt/wazuh-risk-scoring/root-ca.pem \
   --user siem_alarm_service \
-  "https://127.0.0.1:9200/wazuh-alerts-*/_search?size=1&pretty"
+  "https://127.0.0.1:9200/wazuh-alerts-4.x-${ALERT_INDEX_DATE}/_search?size=1&pretty"
 ```
+
+Command wajib menghasilkan dokumen pada index harian UTC aktual. Jika instalasi memakai nama index custom atau tanggal index tidak mengikuti UTC, jangan mengaktifkan timer dengan pola default: sesuaikan `source_index`, lakukan run shadow, dan buktikan tidak ada alert terlambat yang terlewat. Placeholder `{date}` adalah placeholder engine, bukan shell variable, dan diekspansi menjadi `YYYY.MM.DD` untuk setiap bucket.
 
 ---
 
@@ -532,6 +556,8 @@ sudo -u siem-alarm /usr/bin/python3 -B \
   --limit 3000 \
   --output /opt/wazuh-risk-scoring/logs/wazuh_field_audit_report.json
 ```
+
+Default `--index 'wazuh-alerts-4.x-{date}'` di-resolve hanya ke tanggal UTC yang masuk window audit (umumnya dua index untuk 24 jam), bukan wildcard seluruh history. Wildcard ditolak. Jalankan audit satu kali saat beban rendah karena utility memang membaca `_source` lengkap untuk menemukan field custom.
 
 Jangan memakai `--insecure` atau `curl -k`. Jika verifikasi hostname gagal, lihat SAN sertifikat lalu gunakan hostname/IP yang memang tercantum:
 
@@ -611,6 +637,8 @@ sudo curl --fail --silent --show-error \
 ```
 
 `ism_template` otomatis menerapkan policy hanya ke index baru yang cocok. Jangan menempelkan policy delete ke index lama secara massal sebelum umur index, backup, dan persetujuan retensi diperiksa. Jika policy dengan ID yang sama sudah ada, review hasil GET dan ikuti mekanisme update `if_seq_no`/`if_primary_term`; jangan menghapus policy aktif hanya agar PUT berhasil.
+
+Snapshot-Bulk V2 mempertahankan nama dan schema dokumen `alarm_state`/`alarm_escalation`; `_mget`, `_bulk`, dan checkpoint lokal tidak memerlukan index tambahan atau perubahan ISM. Template tetap harus dipasang **sebelum** bulk pertama agar auto-created daily index memperoleh mapping dan setting yang benar. Jangan memakai `refresh=true` pada bulk; `refresh_interval: 30s` pada template sudah cukup untuk visibilitas dashboard tanpa refresh storm.
 
 > Jika `destination_index_prefix` bukan `siem-alarm`, ubah `index_patterns` pada kedua file JSON sebelum instalasi. Fungsi template internal Python otomatis mengikuti prefix config, tetapi file manual harus tetap disinkronkan.
 
@@ -709,6 +737,8 @@ Pastikan config memakai nama key yang memang dibaca oleh script:
   "ca_cert": "/opt/wazuh-risk-scoring/root-ca.pem",
   "retry_attempts": 4,
   "retry_backoff_seconds": 1.0,
+  "source_index": "wazuh-alerts-4.x-{date}",
+  "source_includes": [],
   "bucket_minutes": 60,
   "lookback_minutes": 60,
   "process_current_bucket_only": true,
@@ -716,8 +746,15 @@ Pastikan config memakai nama key yang memang dibaca oleh script:
   "escalation_log_enabled": true,
   "escalation_log_levels": ["Medium", "High", "Critical"],
   "threat_level_strategy": "max",
-  "max_alerts_per_run": 50000,
+  "max_alerts_per_bucket": 100000,
+  "max_cases_per_bucket": 20000,
+  "page_size": 1000,
+  "mget_batch_size": 1000,
+  "bulk_max_actions": 1000,
+  "bulk_max_bytes": 5242880,
+  "max_catchup_buckets_per_run": 2,
   "lock_file": "/opt/wazuh-risk-scoring/logs/scoring.lock",
+  "checkpoint_file": "/var/lib/wazuh-risk-scoring/checkpoint.json",
   "install_template": false
 }
 ```
@@ -728,7 +765,31 @@ Environment file root-only harus berisi password sebenarnya:
 WAZUH_PASS="PASSWORD_INDEXER_SEBENARNYA"
 ```
 
-Program menolak placeholder `GANTI_*`/`CHANGE_*`, prefix index yang tidak aman, numeric limit di luar batas, CA yang tidak ada, dan bucket yang tidak membagi 1 hari secara utuh.
+Program menolak placeholder secret `GANTI_*`/`CHANGE_*`, pola index yang tidak aman, numeric limit di luar batas, CA yang tidak ada, dan bucket yang tidak membagi 1 hari secara utuh. `source_index` V2 wajib mempunyai tepat satu placeholder `{date}`; engine mengekspansinya menggunakan tanggal UTC bucket.
+
+Validasi schema inventory tanpa koneksi Indexer:
+
+```bash
+sudo -u siem-alarm /usr/bin/python3 -B \
+  /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
+  --validate-assets-only /opt/wazuh-risk-scoring/assets.json
+```
+
+File hilang, tipe/schema salah, nilai di luar `1..5`, kategori tidak cocok, ID berpadded, field typo, atau `agent_name` stale akan menghentikan run sebelum penulisan.
+
+Nama legacy `lookback_overlap_minutes` dipertahankan untuk kompatibilitas config, tetapi semantik V2 adalah **finalization eligibility delay**. Nilai `7` berarti bucket menjadi eligible pada boundary +7 menit; karena timer berjalan tiap 5 menit, finalisasi normal terjadi pada tick berikutnya, sekitar boundary +10 menit (ditambah `AccuracySec`). Bucket tertutup tidak digabung dengan query current.
+
+Jika upgrade dari V1, config lama sengaja dipertahankan oleh installer. Sebelum run manual:
+
+- ganti `source_index: "wazuh-alerts-*"` menjadi pola harian yang sudah dibuktikan, default `wazuh-alerts-4.x-{date}`;
+- hapus `max_alerts_per_run` dan gunakan `max_alerts_per_bucket: 100000`;
+- tambahkan `max_cases_per_bucket`, `mget_batch_size`, `bulk_max_actions`, `bulk_max_bytes`, `max_catchup_buckets_per_run`, dan `checkpoint_file` seperti contoh;
+- jangan membuat atau mengedit checkpoint secara manual; engine menulisnya secara atomik hanya untuk run calendar normal yang sukses;
+- manual `--from/--to` tidak boleh memajukan checkpoint calendar.
+
+Checkpoint menyimpan hash identitas case. Perubahan `bucket_minutes`, `source_index`, `min_rule_level`, exclusion rule/group, dedup/rule override, atau destination prefix membuat engine **fail closed** bila tidak cocok dengan checkpoint lama. Untuk perubahan tersebut, hentikan timer lalu pilih salah satu: shadow deployment dengan destination/checkpoint baru, atau archive checkpoint dan lakukan controlled backfill. Jangan menghapus checkpoint hanya agar error hilang. Perubahan asset/threat strategy tidak mengganti identitas case, tetapi closed bucket lama juga tidak dihitung ulang otomatis; backfill diperlukan bila history harus memakai scoring baru.
+
+Nilai 1.000 action/ID dan 5 MiB adalah batas, bukan target yang wajib dipenuhi setiap request. Engine mengirim batch lebih kecil bila ukuran byte tercapai dan tidak memakai `refresh=true`. Jangan menaikkan paralelisme/batch sebelum load test menunjukkan tidak ada `429`, failed shard, atau tekanan heap Indexer.
 
 Interval eksekusi 5 menit diatur oleh systemd timer `OnCalendar=*-*-* *:0/5:00`, bukan oleh key `schedule_interval_minutes` di config.
 Mode `--loop` tersedia di script untuk testing, tetapi tidak direkomendasikan untuk production. Untuk production gunakan systemd timer.
@@ -811,7 +872,8 @@ File ini dibuat otomatis oleh installer. Gunakan isi berikut untuk review:
 [Unit]
 Description=SIEM Alarm Scoring - Wazuh Progressive Alarm Aggregation
 After=network-online.target wazuh-indexer.service
-Wants=network-online.target wazuh-indexer.service
+Wants=network-online.target
+OnFailure=siem-alarm-scoring-failure@%n.service
 
 [Service]
 Type=oneshot
@@ -822,6 +884,8 @@ ExecStart=/usr/bin/python3 -B /opt/wazuh-risk-scoring/siem_alarm_scoring_final.p
 WorkingDirectory=/opt/wazuh-risk-scoring
 RuntimeDirectory=siem-alarm
 RuntimeDirectoryMode=0750
+StateDirectory=wazuh-risk-scoring
+StateDirectoryMode=0750
 UMask=0027
 StandardOutput=journal
 StandardError=journal
@@ -830,13 +894,45 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/wazuh-risk-scoring/logs
+ReadWritePaths=/opt/wazuh-risk-scoring/logs /var/lib/wazuh-risk-scoring
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+RuntimeMaxSec=240s
+TimeoutStopSec=20s
+MemoryHigh=512M
+MemoryMax=1G
+MemorySwapMax=0
+TasksMax=64
+LimitNOFILE=4096
+Nice=5
+CPUWeight=25
+IOWeight=25
+OOMScoreAdjust=500
 CapabilityBoundingSet=
 AmbientCapabilities=
 ```
+
+`After=wazuh-indexer.service` hanya mengatur urutan bila Indexer sedang dimulai oleh mekanisme lain; unit scorer sengaja tidak me-`Wants` Indexer agar maintenance stop tidak dibatalkan oleh timer. `StateDirectory` memisahkan checkpoint mutable dari application files. `MemoryHigh=512M` memberi pressure lebih awal dan `MemoryMax=1G` menjadi hard stop agar Python tidak menekan heap Indexer pada AIO. `MemorySwapMax=0` mencegah scorer membuat host thrashing. `RuntimeMaxSec=240s` menyisakan waktu sebelum jadwal lima menit berikutnya; bulk/checkpoint yang idempotent membuat run aman diulang bila service dihentikan pada limit. `Nice=5`, `CPUWeight=25`, dan `IOWeight=25` memprioritaskan Wazuh saat ada contention; weight bukan quota sehingga scorer tetap dapat memakai kapasitas idle.
+
+Failure handler berikut juga dibuat installer:
+
+```ini
+[Unit]
+Description=Record SIEM Alarm Scoring failure for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t siem-alarm-scoring "Unit %i failed; inspect journalctl -u %i"
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+```
+
+Handler hanya mencatat `daemon.crit`; ia tidak mengirim email/webhook. Monitoring SOC wajib membuat alert eksternal untuk journal tag `siem-alarm-scoring` dan heartbeat/checkpoint yang stale.
 
 ### 12.2 Buat systemd timer unit
 
@@ -867,6 +963,7 @@ WantedBy=timers.target
 ```bash
 sudo systemd-analyze verify \
   /etc/systemd/system/siem-alarm-scoring.service \
+  /etc/systemd/system/siem-alarm-scoring-failure@.service \
   /etc/systemd/system/siem-alarm-scoring.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now siem-alarm-scoring.timer
@@ -883,7 +980,17 @@ sudo systemctl list-timers --all | grep siem-alarm
 
 # Cek hasil run terakhir
 sudo systemctl status siem-alarm-scoring.service --no-pager
+
+# Failure handler (output kosong adalah normal bila belum pernah gagal)
+sudo journalctl -t siem-alarm-scoring -n 50 --no-pager
+
+# Setelah run sukses, verifikasi owner/mode state directory dan checkpoint
+sudo stat -c '%U:%G %a %n' \
+  /var/lib/wazuh-risk-scoring \
+  /var/lib/wazuh-risk-scoring/checkpoint.json
 ```
+
+Expected: directory `siem-alarm:siem-alarm 750`; checkpoint harus dimiliki service dan tidak world-readable (`640` atau lebih ketat).
 
 Output yang diharapkan dari `list-timers`:
 
@@ -910,6 +1017,7 @@ sudo systemctl enable --now siem-alarm-scoring.timer
 **Service gagal:**
 ```bash
 sudo journalctl -u siem-alarm-scoring.service -n 100 --no-pager
+sudo journalctl -t siem-alarm-scoring -n 100 --no-pager
 sudo tail -n 100 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
 ```
 
@@ -927,41 +1035,92 @@ sudo systemctl restart siem-alarm-scoring.timer
 
 ### 12.7 Manual backfill setelah outage
 
-`lookback_overlap_minutes=7` melindungi alert di akhir bucket jika service terlambat beberapa menit. Jika VM/service mati lebih lama dari overlap tersebut, jalankan backfill manual dengan window waktu eksplisit.
+`lookback_overlap_minutes=7` adalah finalization eligibility delay: closed bucket menjadi eligible setelah tujuh menit dan normalnya dibaca pada tick +10 menit, terpisah dari current bucket. Alert yang baru terindeks setelah finalisasi aktual memerlukan replay/backfill. Checkpoint V2 memproses maksimal `max_catchup_buckets_per_run=2` bucket tertinggal pada satu run agar restart tidak membuat query storm. Jika outage lebih panjang, checkpoint tidak maju, catch-up tetap tertinggal, atau SOC memerlukan recovery terkontrol, jalankan backfill per bucket dengan window eksplisit.
 
-Gunakan waktu UTC dan mulai dari awal bucket:
+Gunakan waktu UTC, mulai/akhir tepat pada boundary bucket, dan jalankan melalui transient systemd unit agar proteksi resource tetap berlaku. Blok berikut meminta waktu secara interaktif, hanya menerima **satu** bucket satu jam, meminta konfirmasi, dan tidak akan menyalakan timer yang sebelumnya memang nonaktif. Password dibaca unit dari environment file, bukan command line:
 
 ```bash
+siem_alarm_backfill_one_bucket() {
+read -r -p 'BACKFILL_FROM UTC (YYYY-MM-DDTHH:00:00Z): ' BACKFILL_FROM
+read -r -p 'BACKFILL_TO   UTC (YYYY-MM-DDTHH:00:00Z): ' BACKFILL_TO
+
+BOUNDARY_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z$'
+if [[ ! "${BACKFILL_FROM}" =~ ${BOUNDARY_RE} || ! "${BACKFILL_TO}" =~ ${BOUNDARY_RE} ]]; then
+  echo 'Format/boundary UTC ditolak.' >&2
+  return 1
+fi
+BACKFILL_FROM_EPOCH="$(date -u -d "${BACKFILL_FROM}" +%s)" || return 1
+BACKFILL_TO_EPOCH="$(date -u -d "${BACKFILL_TO}" +%s)" || return 1
+if (( BACKFILL_TO_EPOCH - BACKFILL_FROM_EPOCH != 3600 )); then
+  echo 'Backfill harus tepat satu bucket 1 jam.' >&2
+  return 1
+fi
+printf 'Akan backfill: %s <= timestamp < %s\n' "${BACKFILL_FROM}" "${BACKFILL_TO}"
+read -r -p 'Ketik BACKFILL untuk melanjutkan: ' BACKFILL_CONFIRM
+if [[ "${BACKFILL_CONFIRM}" != 'BACKFILL' ]]; then
+  echo 'Backfill dibatalkan.'
+  return 1
+fi
+
+TIMER_WAS_ACTIVE=0
+if sudo systemctl is-active --quiet siem-alarm-scoring.timer; then
+  TIMER_WAS_ACTIVE=1
+fi
 sudo systemctl stop siem-alarm-scoring.timer
-read -rsp 'Indexer password: ' WAZUH_PASS; echo
-export WAZUH_PASS
-if sudo --preserve-env=WAZUH_PASS -u siem-alarm /usr/bin/python3 -B \
+sudo systemctl stop siem-alarm-scoring.service
+if sudo systemd-run --quiet --wait --collect \
+    --unit=siem-alarm-backfill \
+    --uid=siem-alarm --gid=siem-alarm \
+    --working-directory=/opt/wazuh-risk-scoring \
+    --property=EnvironmentFile=/etc/wazuh-risk-scoring/siem-alarm.env \
+    --property=StateDirectory=wazuh-risk-scoring \
+    --property=StateDirectoryMode=0750 \
+    --property=NoNewPrivileges=true \
+    --property=PrivateTmp=true \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=true \
+    --property='ReadWritePaths=/opt/wazuh-risk-scoring/logs /var/lib/wazuh-risk-scoring' \
+    --property=MemoryHigh=512M \
+    --property=MemoryMax=1G \
+    --property=MemorySwapMax=0 \
+    --property=CPUWeight=25 \
+    --property=IOWeight=25 \
+    --property=RuntimeMaxSec=240s \
+    /usr/bin/python3 -B \
     /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
     --config /opt/wazuh-risk-scoring/config.siem_alarm.json \
     --once \
-    --from 2026-05-22T10:00:00Z \
-    --to 2026-05-22T12:00:00Z; then
-  unset WAZUH_PASS
-  sudo systemctl start siem-alarm-scoring.timer
+    --from "${BACKFILL_FROM}" \
+    --to "${BACKFILL_TO}"; then
+  if (( TIMER_WAS_ACTIVE == 1 )); then
+    sudo systemctl start siem-alarm-scoring.timer
+  fi
+  echo 'Backfill sukses.'
 else
   BACKFILL_STATUS=$?
-  unset WAZUH_PASS
   echo "Backfill gagal (exit ${BACKFILL_STATUS}); timer sengaja tetap berhenti." >&2
-  false
+  return "${BACKFILL_STATUS}"
 fi
+}
+siem_alarm_backfill_one_bucket
+BACKFILL_RESULT=$?
+unset -f siem_alarm_backfill_one_bucket
+(( BACKFILL_RESULT == 0 ))
 ```
 
 Catatan:
-- Gunakan `--from` pada awal jam/bucket agar count bucket awal tidak parsial.
-- `--from` bersifat inclusive (`>=`) dan `--to` bersifat exclusive (`<`). Contoh di atas memproses `10:00:00Z <= timestamp < 12:00:00Z`.
+- `--from` dan explicit `--to` wajib tepat pada boundary bucket UTC; engine menolak window manual yang tidak aligned agar snapshot tidak parsial.
+- `--from` bersifat inclusive (`>=`) dan `--to` bersifat exclusive (`<`).
 - Jangan gunakan `--loop` untuk backfill.
-- Hentikan timer selama backfill agar run calendar tidak bertabrakan; lock tetap menjadi pengaman terakhir.
-- Jika jumlah alert sangat besar dan run berhenti karena `max_alerts_per_run`, naikkan limit sementara atau pecah backfill menjadi window lebih kecil.
+- Hentikan timer dan scorer aktif selama backfill agar run calendar tidak bertabrakan; lock tetap menjadi pengaman terakhir. Pada kegagalan, timer sengaja dibiarkan berhenti untuk investigasi.
+- Manual `--from/--to` tidak memajukan checkpoint calendar. Setelah sukses, run calendar berikutnya tetap memvalidasi backlog checkpoint secara idempotent.
+- Jika satu bucket melebihi `max_alerts_per_bucket`, **jangan pecah di tengah bucket**: snapshot parsial akan menghasilkan frequency/count yang salah. Ukur resource di staging, lalu naikkan limit dan batas cgroup secara terkontrol atau kurangi alert noisy di sumber agregasi tanpa menghapus raw evidence.
 - Backfill historis dapat membuat dokumen `alarm_escalation` lama. Untuk mencegah aplikasi eksternal menganggapnya alert baru, pertimbangkan set sementara `"escalation_log_enabled": false` saat backfill historis, atau pastikan aplikasi eksternal memfilter window waktu yang benar.
 
 ### 12.8 Checklist scheduling
 
 - [ ] `/etc/systemd/system/siem-alarm-scoring.service` dibuat.
+- [ ] `/etc/systemd/system/siem-alarm-scoring-failure@.service` dibuat dan journal tag-nya dimonitor eksternal.
 - [ ] `/etc/systemd/system/siem-alarm-scoring.timer` dibuat.
 - [ ] `OnCalendar=*-*-* *:0/5:00` sudah terkonfigurasi.
 - [ ] `systemctl daemon-reload` dijalankan.
@@ -969,6 +1128,8 @@ Catatan:
 - [ ] `systemctl list-timers` menampilkan NEXT run dalam ~5 menit.
 - [ ] Service berhasil jalan minimal sekali.
 - [ ] Log tidak ada error.
+- [ ] Checkpoint `/var/lib/wazuh-risk-scoring/checkpoint.json` dibuat setelah run calendar sukses dan dimiliki `siem-alarm:siem-alarm`.
+- [ ] Run selesai sebelum `RuntimeMaxSec=240s` dan tidak menyentuh `MemoryMax=1G`.
 - [ ] `raw_alert_count` bertambah antara dua run berturutan (validasi progressive update).
 
 ---
@@ -1031,7 +1192,7 @@ GET siem-alarm-*/_search
 ### 14.3 Cross-check manual ke raw alert
 
 ```json
-GET wazuh-alerts-*/_count
+GET wazuh-alerts-4.x-2026.05.22/_count
 {
   "query": {
     "bool": {
@@ -1220,7 +1381,7 @@ timestamp       → wajib ada
 - [ ] Description jelas untuk dashboard SOC.
 - [ ] Tidak terlalu noisy tanpa tuning.
 - [ ] Field custom penting sudah masuk audit.
-- [ ] Jika perlu, field custom masuk evidence extraction.
+- [ ] Jika scoring membutuhkan field custom, path-nya ditambahkan ke array `source_includes`; tanpa ini field tidak ikut payload `_source` terfilter.
 
 ---
 
@@ -1258,6 +1419,22 @@ Menjadi:
 
 Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 
+### 18.4 Guardrail performa Snapshot-Bulk V2
+
+`max_alerts_per_bucket=100000` dan `max_cases_per_bucket=20000` adalah fail-safe ceiling, **bukan** jaminan bahwa VM mampu memproses batas itu dalam 240 detik. Batas case mencegah mode dedup/cardinality ekstrem memenuhi RAM sebelum bulk. Kapasitas aktual ditentukan alert per bucket, jumlah case unik, cardinality evidence, heap/disk Indexer, dan ukuran dokumen hasil.
+
+Dengan `A` raw alert, `C` case unik, page/mget/bulk 1.000, jumlah request normal kira-kira:
+
+```text
+search/scroll  ≈ ceil(A / 1000)
+state _mget    ≈ ceil(C / 1000)
+bulk write     ≈ sampai 2 × ceil(C / 1000), dapat bertambah bila batas 5 MiB tercapai
+```
+
+Dengan timer lima menit dan laju alert yang relatif merata, snapshot current membaca sekitar `5,5 × A` per jam, lalu finalisasi closed bucket menambah `1 × A`: total sekitar `6,5 × A`. Pola lama yang membaca previous bucket pada dua run awal boundary mendekati `7,5 × A`, sehingga V2 mengurangi scan steady-state sekitar 13% sambil tetap menghasilkan snapshot penuh. Contoh `A=20.000` dan `C=500` memerlukan kira-kira 20 request search/scroll + 1 `_mget` + maksimal 2 bulk, bukan ratusan/ribuan HTTP per-case. Angka ini model kapasitas, bukan pengganti load test karena burst dan cardinality evidence dapat mengubah hasil.
+
+Jangan menambah worker paralel pada AIO. Batch berjalan serial dan bounded agar pengurangan round-trip tidak berubah menjadi burst CPU/heap/disk pada Indexer. Tuning yang aman dilakukan berurutan: pertahankan exact daily index dan source filtering, ukur peak, kurangi rule noisy dari agregasi, lalu ubah batch/limit hanya melalui shadow load test. Raw `wazuh-alerts-*` tetap menjadi buffer/evidence resmi; proyek tidak membuat queue raw kedua.
+
 ---
 
 ## 19. Kesalahan Fatal yang Harus Dihindari
@@ -1279,6 +1456,11 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] Menonaktifkan TLS verification untuk production.
 - [ ] Membiarkan runtime meng-install template setiap 5 menit.
 - [ ] Meng-update `alarm_state` sebelum memastikan event eskalasi sudah ada.
+- [ ] Memberi `cluster_composite_ops`/`indices_all` ketika runtime hanya membutuhkan permission bulk individual.
+- [ ] Menganggap HTTP 200 berarti seluruh item `_bulk` sukses tanpa memeriksa `errors` dan status setiap item.
+- [ ] Memakai `refresh=true` pada setiap bulk dan menambah pressure refresh Indexer.
+- [ ] Memecah backfill di tengah bucket lalu menganggap count parsial sebagai snapshot lengkap.
+- [ ] Mengedit/menghapus checkpoint saat timer atau service masih aktif.
 
 ---
 
@@ -1289,12 +1471,13 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] `wazuh-alerts-*` normal dan terisi.
 
 **Persiapan:**
-- [ ] Internal user/role Indexer `siem_alarm_service` dibuat dengan least privilege.
+- [ ] Internal user/role Indexer `siem_alarm_service` memakai cluster `cluster_composite_ops_ro` + `indices:data/write/bulk*`, source `read`, destination `read,index,create_index`, tanpa permission lebih luas.
 - [ ] TLS verification berhasil memakai `/opt/wazuh-risk-scoring/root-ca.pem`; tidak ada `-k`/`verify_ssl: false` di production.
 - [ ] `/etc/wazuh-risk-scoring/siem-alarm.env` berisi secret sebenarnya dan permission `0640 root:siem-alarm`.
 - [ ] Audit field sudah dijalankan.
-- [ ] Asset value disiapkan via labels atau `assets.json`.
-- [ ] Config script sudah disesuaikan (`bucket_minutes: 60`, `lookback_minutes: 60`, `process_current_bucket_only: true`, `lookback_overlap_minutes: 7`, `escalation_log_enabled: true`, `max_alerts_per_run: 50000`, `install_template: false`).
+- [ ] Inventory root-owned `assets.json` mencakup semua agent emitting; fallback label hanya dipakai bila disengaja dan `asset.source=default` sudah diaudit.
+- [ ] Config Snapshot-Bulk V2 sudah disesuaikan (`source_index: wazuh-alerts-4.x-{date}`, `bucket_minutes: 60`, eligibility delay `lookback_overlap_minutes: 7`, `max_alerts_per_bucket: 100000`, `max_cases_per_bucket: 20000`, `_mget`/bulk: 1000, bulk: 5 MiB, catch-up: 2, checkpoint di `/var/lib`, `install_template: false`).
+- [ ] Nama/tanggal index harian aktual, boundary tengah malam UTC, dan alert terlambat sudah diuji; pola exact-date tidak kehilangan evidence.
 - [ ] Index template `siem-alarm-*` sudah dibuat (termasuk mapping field `risk.level_history`).
 - [ ] ISM retention policy sudah dipasang dan umur retensi disetujui pemilik data.
 
@@ -1307,9 +1490,13 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] Progressive update tervalidasi (run dua kali, count bertambah, document ID sama).
 - [ ] `risk.level_history` terisi dengan benar.
 - [ ] `risk.level_changed` ter-set `true` saat level naik.
+- [ ] Output V2 dibandingkan dengan query raw/V1 untuk bucket yang sama: case key, count, score, level, dan escalation identik.
+- [ ] Hash identitas checkpoint cocok dengan config; setiap perubahan bucket/source/filter/dedup/destination memiliki rencana shadow/backfill, bukan reset diam-diam.
+- [ ] Bulk failure injection membuktikan hanya item gagal yang diulang, `409` create-only dianggap idempotent, dan state tidak mendahului escalation.
+- [ ] Load test minimal dua kali peak aktual: p95 run <60 detik, maksimum <240 detik, tidak ada `429`/failed shard, dan checkpoint hanya maju setelah seluruh bucket sukses.
 
 **Scheduling:**
-- [ ] Systemd service dan timer dibuat.
+- [ ] Systemd service, failure handler, dan timer dibuat; `systemd-analyze verify` lulus pada host target.
 - [ ] `systemctl list-timers` menampilkan NEXT run dalam ~5 menit.
 - [ ] Timer jalan minimal sekali setelah di-enable.
 - [ ] Tidak ada dua proses scoring bersamaan; lock contention menghasilkan exit gagal yang terlihat.
@@ -1323,7 +1510,7 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 - [ ] Failure injection: jika state write gagal setelah escalation create, run berikutnya pulih tanpa kehilangan/duplikasi escalation event.
 
 **Operasional:**
-- [ ] Log script dimonitor.
+- [ ] Log script, journal `daemon.crit`, usia checkpoint, durasi run, memory peak, serta rejection/heap Indexer dimonitor.
 - [ ] Logrotate berhasil dan journal tidak berisi duplikasi baris ke file yang sama.
 - [ ] Rollback plan disiapkan.
 - [ ] Prosedur manual backfill `--from/--to` dipahami untuk outage panjang.
@@ -1346,80 +1533,54 @@ Agar dokumen `alarm_escalation` hanya dibuat saat level High ke atas.
 
 ### 21.2 Langkah rollback
 
-**Step 1 — Stop timer:**
+**Step 1 — Isolasi scorer tanpa menyentuh raw alert atau output:**
+
 ```bash
 sudo systemctl stop siem-alarm-scoring.timer
 sudo systemctl stop siem-alarm-scoring.service
 sudo systemctl disable siem-alarm-scoring.timer
-```
-
-**Step 2 — Verifikasi berhenti:**
-```bash
-sudo systemctl list-timers --all | grep siem-alarm
-# Tidak ada entry aktif
-```
-
-**Step 3 — Hapus index bermasalah:**
-```bash
-sudo curl --fail --silent --show-error \
-  --connect-timeout 10 --max-time 60 \
-  --cacert /opt/wazuh-risk-scoring/root-ca.pem \
-  --user admin \
-  'https://127.0.0.1:9200/_cat/indices/siem-alarm-*?v'
-
-# Hapus satu index hanya setelah nama persis dikonfirmasi
-DELETE_INDEX='siem-alarm-2026.05.22'
-if [[ ! "${DELETE_INDEX}" =~ ^siem-alarm-[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]]; then
-  echo 'Nama index ditolak oleh safety guard.' >&2
+if sudo systemctl is-active --quiet siem-alarm-scoring.timer \
+  || sudo systemctl is-active --quiet siem-alarm-scoring.service; then
+  echo 'Scorer masih aktif; rollback dihentikan.' >&2
   false
 else
-  read -r -p "Ketik ${DELETE_INDEX} untuk menghapusnya: " CONFIRM_DELETE_INDEX
-  if [[ "${CONFIRM_DELETE_INDEX}" == "${DELETE_INDEX}" ]]; then
-    sudo curl --fail --silent --show-error \
-      --connect-timeout 10 --max-time 60 \
-      --cacert /opt/wazuh-risk-scoring/root-ca.pem \
-      --user admin -X DELETE \
-      "https://127.0.0.1:9200/${DELETE_INDEX}"
-  else
-    echo 'Pembatalan: nama index tidak cocok.'
-  fi
-fi
-
-# ATAU hapus semua hanya setelah konfirmasi eksplisit
-read -r -p 'Ketik HAPUS-SEMUA-SIEM-ALARM: ' CONFIRM_DELETE
-if [[ "${CONFIRM_DELETE}" == "HAPUS-SEMUA-SIEM-ALARM" ]]; then
-  sudo curl --fail --silent --show-error \
-    --connect-timeout 10 --max-time 60 \
-    --cacert /opt/wazuh-risk-scoring/root-ca.pem \
-    --user admin -X DELETE \
-    "https://127.0.0.1:9200/siem-alarm-*"
-else
-  echo 'Pembatalan: konfirmasi tidak cocok.'
+  echo 'Scorer terisolasi. Wazuh utama tetap berjalan.'
 fi
 ```
 
-> `wazuh-alerts-*` **TIDAK DISENTUH** dalam rollback apapun.
+Rollback normal berhenti di sini sambil investigasi. `wazuh-alerts-*`, `siem-alarm-*`, dan checkpoint tidak dihapus; dashboard dapat sementara diberi banner bahwa agregasi sedang pause.
 
-**Step 4 — Identifikasi penyebab dari log:**
+**Step 2 — Simpan bukti dan identifikasi penyebab:**
+
 ```bash
 sudo tail -n 200 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
 sudo journalctl -u siem-alarm-scoring.service -n 100 --no-pager
+sudo ls -1dt /opt/wazuh-risk-scoring/backups/* 2>/dev/null | head
 ```
 
-**Step 5 — Perbaiki config/script:**
+**Jalur A — rollback code/config tanpa menghapus output (default):**
+
+- Review backup installer mode root-only dan diff file yang akan dipulihkan.
+- Deploy ulang paket known-good melalui `sudo bash ./setup_siem_alarm_final.sh`; installer akan kembali meninggalkan timer nonaktif.
+- Jika hanya config/inventory yang salah, pulihkan file itu secara selektif dari backup setelah review. Jangan menyalin seluruh direktori backup secara buta karena checkpoint, unit, secret, dan schema dapat berasal dari versi berbeda.
+- Jalankan validator asset, manual service, query output, lalu enable timer hanya setelah hasil benar.
+
 ```bash
 sudoedit /opt/wazuh-risk-scoring/config.siem_alarm.json
-# Perubahan source dilakukan di repository, dites, lalu deploy ulang via installer.
-```
-
-**Step 6 — Test manual ulang:**
-```bash
+sudo -u siem-alarm /usr/bin/python3 -B \
+  /opt/wazuh-risk-scoring/siem_alarm_scoring_final.py \
+  --validate-assets-only /opt/wazuh-risk-scoring/assets.json
 sudo systemctl start siem-alarm-scoring.service
-
+sudo systemctl show siem-alarm-scoring.service -p Result -p ExecMainStatus
 sudo tail -n 50 /opt/wazuh-risk-scoring/logs/siem_alarm_scoring.log
 ```
 
-**Step 7 — Re-enable setelah yakin benar:**
+**Jalur B — rebuild output (change-controlled, bukan rollback rutin):**
+
+Jangan menjalankan wildcard `DELETE siem-alarm-*` dari runbook copy-paste. Rebuild hanya dilakukan setelah snapshot/backup, rentang UTC dan daftar **nama index persis** disetujui, timer/service terbukti berhenti, checkpoint diarsipkan (bukan diedit), dan seluruh bucket yang dihapus dijadwalkan untuk backfill dari `wazuh-alerts-*`. Setelah satu destination index dihapus, checkpoint lama tidak membuktikan history lengkap; jangan start service/timer sampai backfill boundary-aligned pada bagian 12.7 dan validasi count selesai. Jika raw index sumber sudah melewati retensi, rebuild lengkap tidak mungkin dilakukan.
+
+**Step 3 — Re-enable hanya untuk Jalur A yang sudah lolos validasi atau Jalur B yang sudah selesai rebuild:**
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now siem-alarm-scoring.timer
@@ -1429,9 +1590,10 @@ sudo systemctl list-timers | grep siem-alarm
 ### 21.3 Rollback checklist
 
 - [ ] Timer dihentikan sebelum rollback.
+- [ ] Checkpoint tetap utuh untuk rollback normal; archive/rebuild hanya lewat change control.
 - [ ] `wazuh-alerts-*` tidak disentuh.
 - [ ] Penyebab diidentifikasi dari log.
-- [ ] Script/config diperbaiki.
+- [ ] Jalur A (restore code/config) atau Jalur B (rebuild output) dipilih dan didokumentasikan.
 - [ ] Test manual berhasil sebelum re-enable.
 - [ ] Timer di-enable ulang dan NEXT run terlihat.
 
@@ -1442,20 +1604,22 @@ sudo systemctl list-timers | grep siem-alarm
 Desain final:
 
 ```text
-wazuh-alerts-*  → raw evidence, tidak pernah diubah
-siem-alarm-*    → progressive alarm, di-update tiap 5 menit, bucket 1 jam
+wazuh-alerts-*  → raw evidence, tidak pernah diubah; query memakai concrete daily index
+siem-alarm-*    → snapshot progressive alarm, di-update tiap 5 menit, bucket 1 jam
 
 Dedup key default  : agent.id + rule.id + timestamp_bucket_1h
 alarm.id           : sha256(case_key), dipakai sebagai document ID → update, bukan insert baru
-raw_alert_count    : bertambah setiap 5 menit selama bucket berjalan
+raw_alert_count    : dihitung ulang eksak; retry tidak menambah count dua kali
 risk.score         : naik organik seiring raw_alert_count bertambah
 Log eskalasi       : dokumen alarm_escalation di siem-alarm-* saat level eligible/naik
 Maks log eskalasi  : 3 per alarm per bucket (Medium, High, Critical)
 Evidence           : srcip/dstip/port/proto/url/user/file/hash — bukan pemecah case
+Read/write state   : `_mget` + two-phase bounded `_bulk`, tanpa refresh paksa
+Recovery           : checkpoint atomik + maksimal dua catch-up bucket per run
 ```
 
 Ini adalah desain yang paling realistis untuk menekan alert fatigue tanpa kehilangan raw evidence dan tetap memberikan visibilitas real-time ke SOC.
 
 ---
 
-*Versi 4.1 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, version gate installer, certificate-chain preflight, TLS verification mandatory, least-privilege `read/index/create_index`, escalation create-only sebelum state, retry/backoff, failed-shard validation, process lock, calendar timer persistent, journald + logrotate, backup installer, systemd verification, dan ISM retention policy.*
+*Versi 5.1 — Baseline Wazuh 4.14.7/Filebeat 7.10.2, exact daily source index, source filtering, Snapshot-Bulk V2 (`_mget` + two-phase `_bulk`), asset inventory tervalidasi, cardinality/checkpoint/catch-up bounded, least-privilege bulk permission, resource-capped systemd, OnFailure journal handler, TLS mandatory, deterministic escalation/state, backup installer, template, dan ISM retention.*

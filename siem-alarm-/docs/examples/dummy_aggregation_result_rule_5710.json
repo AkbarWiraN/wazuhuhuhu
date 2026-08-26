@@ -1,0 +1,107 @@
+{
+  "notice": "HASIL DETERMINISTIK DATA DUMMY; dihitung dengan siem_alarm_scoring_final.py dan assets.example.json.",
+  "source_file": "docs/examples/dummy_wazuh_alerts_rule_5710.json",
+  "destination_index": "siem-alarm-2026.08.26",
+  "aggregation_mode": "coarse",
+  "bucket": {
+    "start": "2026-08-26T10:00:00Z",
+    "size": "1h",
+    "case_key": "coarse|002|5710|2026-08-26T10:00:00Z",
+    "state_id": "eccbdf4cc5236eff5993454b8c1ecd535e836e8bbab012d13bd196f9077bb347"
+  },
+  "run_1_after_5_raw_alerts": {
+    "document": {"type": "alarm_state"},
+    "alarm": {
+      "event_count": 5,
+      "first_seen": "2026-08-26T10:05:11Z",
+      "last_seen": "2026-08-26T10:10:02Z"
+    },
+    "source_observed": {
+      "srcip_unique_count": 3,
+      "srcip_samples": ["203.0.113.10", "192.0.2.44", "198.51.100.24"],
+      "top_srcip": [
+        {"value": "203.0.113.10", "count": 3},
+        {"value": "192.0.2.44", "count": 1},
+        {"value": "198.51.100.24", "count": 1}
+      ]
+    },
+    "risk": {
+      "asset_value": 4,
+      "threat_score": 2,
+      "frequency_count_1h": 5,
+      "frequency_score": 1,
+      "score": 2.33,
+      "level": "Low",
+      "previous_level": null,
+      "level_changed": false,
+      "escalation_log_required": false,
+      "formula": "(A+B+C)/3"
+    }
+  },
+  "run_2_after_10_raw_alerts": {
+    "document": {"type": "alarm_state"},
+    "alarm": {
+      "id": "eccbdf4cc5236eff5993454b8c1ecd535e836e8bbab012d13bd196f9077bb347",
+      "case_key": "coarse|002|5710|2026-08-26T10:00:00Z",
+      "deduplication_mode": "coarse",
+      "case_type": "auth",
+      "status": "open",
+      "bucket_start": "2026-08-26T10:00:00Z",
+      "bucket_size": "1h",
+      "first_seen": "2026-08-26T10:05:11Z",
+      "last_seen": "2026-08-26T10:18:03Z",
+      "event_count": 10
+    },
+    "agent": {"id": "002", "name": "srv-web-01", "ip": "192.168.100.99"},
+    "rule": {
+      "id": "5710",
+      "level": 5,
+      "description": "sshd: Attempt to login using a non-existent user"
+    },
+    "source_observed": {
+      "srcip_unique_count": 3,
+      "srcip_samples": ["203.0.113.10", "198.51.100.24", "192.0.2.44"],
+      "top_srcip": [
+        {"value": "203.0.113.10", "count": 5},
+        {"value": "198.51.100.24", "count": 3},
+        {"value": "192.0.2.44", "count": 2}
+      ]
+    },
+    "entity_observed": {
+      "user_unique_count": 9,
+      "user_samples": ["admin", "backup", "deploy", "guest", "oracle", "postgres", "support", "test", "ubuntu"]
+    },
+    "risk": {
+      "asset_value": 4,
+      "threat_score": 2,
+      "frequency_count_1h": 10,
+      "frequency_score": 2,
+      "score": 2.67,
+      "level": "Medium",
+      "previous_level": "Low",
+      "level_changed": true,
+      "escalation_log_required": true,
+      "level_history": [
+        {"level": "Low", "at": "2026-08-26T10:05:11Z"},
+        {"level": "Medium", "at": "2026-08-26T10:18:03Z"}
+      ],
+      "formula": "(A+B+C)/3"
+    },
+    "source": {
+      "index": "wazuh-alerts-4.x-2026.08.26",
+      "raw_alert_count": 10,
+      "sample_document_id": "dummy-5710-001"
+    }
+  },
+  "new_alarm_escalation": {
+    "document": {"type": "alarm_escalation"},
+    "event": {"kind": "alert", "action": "risk_level_escalated"},
+    "escalation": {
+      "id": "90c8d3535850c342651b62572c46c32fc8182cf8e2f49498a172e26c560595d4",
+      "state_alarm_id": "eccbdf4cc5236eff5993454b8c1ecd535e836e8bbab012d13bd196f9077bb347",
+      "level": "Medium",
+      "previous_level": "Low",
+      "reason": "risk_level_increased"
+    }
+  }
+}

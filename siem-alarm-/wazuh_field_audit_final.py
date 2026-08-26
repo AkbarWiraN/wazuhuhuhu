@@ -24,13 +24,14 @@ import getpass
 import json
 import os
 import random
+import re
 import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 ALIASES = {
@@ -70,6 +71,28 @@ def get_path(data: Dict[str, Any], path: str, default: Any = None) -> Any:
     return cur
 
 
+def resolve_indices(pattern: str, start: dt.datetime, end: dt.datetime) -> List[str]:
+    pattern = pattern.strip()
+    if not pattern or pattern.lower() != pattern:
+        raise ValueError("--index must be non-empty and lowercase")
+    if pattern.count("{date}") == 1:
+        sample = pattern.replace("{date}", "2026.08.25")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", sample):
+            raise ValueError("--index must resolve to an exact OpenSearch index name")
+        indices: List[str] = []
+        day = start.astimezone(dt.timezone.utc).date()
+        last_day = end.astimezone(dt.timezone.utc).date()
+        while day <= last_day:
+            indices.append(pattern.replace("{date}", day.strftime("%Y.%m.%d")))
+            day += dt.timedelta(days=1)
+        return indices
+    if "{date}" in pattern or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", pattern):
+        raise ValueError(
+            "--index must contain exactly one {date} placeholder or be one exact index; wildcards are rejected"
+        )
+    return [pattern]
+
+
 class Client:
     RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
 
@@ -79,7 +102,7 @@ class Client:
         username: str,
         password: str,
         verify_ssl: bool,
-        ca_cert: str | None = None,
+        ca_cert: Optional[str] = None,
         retry_attempts: int = 4,
     ):
         self.url = url.rstrip("/")
@@ -92,7 +115,12 @@ class Client:
         }
         self.ctx = ssl.create_default_context(cafile=ca_cert) if verify_ssl else ssl._create_unverified_context()
 
-    def request(self, method: str, path: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         url = f"{self.url}/{path.lstrip('/')}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self.headers, method=method.upper())
@@ -121,8 +149,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Audit actual Wazuh alert fields")
     parser.add_argument("--url", default="https://127.0.0.1:9200")
     parser.add_argument("--user", default="siem_alarm_service")
-    parser.add_argument("--password")
-    parser.add_argument("--index", default="wazuh-alerts-*")
+    parser.add_argument(
+        "--index",
+        default="wazuh-alerts-4.x-{date}",
+        help="Exact daily index pattern; {date} is expanded only for the audited UTC window",
+    )
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--limit", type=int, default=3000)
     parser.add_argument(
@@ -140,21 +171,30 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.hours <= 0:
-        parser.error("--hours must be greater than zero")
+    if not 1 <= args.hours <= 168:
+        parser.error("--hours must be between 1 and 168")
     if not 1 <= args.limit <= 10000:
         parser.error("--limit must be between 1 and 10000")
     if not 1 <= args.retry_attempts <= 10:
         parser.error("--retry-attempts must be between 1 and 10")
     if args.verify_ssl and args.ca_cert and not os.path.isfile(args.ca_cert):
         parser.error(f"CA certificate not found: {args.ca_cert}")
+    if not args.url.startswith("https://"):
+        parser.error("--url must use https://")
 
-    password = args.password or os.environ.get("WAZUH_PASS")
+    now = dt.datetime.now(dt.timezone.utc)
+    start = now - dt.timedelta(hours=args.hours)
+    try:
+        indices = resolve_indices(args.index, start, now)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    password = os.environ.get("WAZUH_PASS")
     if not password:
         password = getpass.getpass("Indexer password: ")
 
     client = Client(args.url, args.user, password, args.verify_ssl, args.ca_cert, args.retry_attempts)
-    gte = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)).isoformat().replace("+00:00", "Z")
+    gte = start.isoformat().replace("+00:00", "Z")
 
     body = {
         "size": args.limit,
@@ -162,12 +202,19 @@ def main() -> int:
         "sort": [{"timestamp": {"order": "desc"}}],
         "_source": True,
     }
-    response = client.request("POST", f"{args.index}/_search", body)
+    index_expression = ",".join(indices)
+    response = client.request(
+        "POST",
+        f"{index_expression}/_search?ignore_unavailable=true&allow_no_indices=false",
+        body,
+    )
     if response.get("timed_out") is True:
         raise RuntimeError("Indexer search timed out")
     shards = response.get("_shards", {})
     if isinstance(shards, dict) and int(shards.get("failed", 0)) > 0:
         raise RuntimeError(f"Indexer search has failed shards: {shards.get('failures', [])}")
+    if not isinstance(shards, dict) or int(shards.get("total", 0)) < 1:
+        raise RuntimeError(f"No concrete alert index resolved from: {index_expression}")
     hits = response.get("hits", {}).get("hits", [])
 
     all_fields = collections.Counter()
@@ -227,7 +274,8 @@ def main() -> int:
     report = {
         "summary": {
             "sample_count": len(hits),
-            "index": args.index,
+            "index_pattern": args.index,
+            "resolved_indices": indices,
             "hours": args.hours,
         },
         "top_fields": all_fields.most_common(300),

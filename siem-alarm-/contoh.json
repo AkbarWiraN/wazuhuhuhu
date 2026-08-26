@@ -15,7 +15,7 @@
     "timestamp": "2026-04-21T02:42:05.483+0000",
     "agent": {
       "id": "002",
-      "name": "DVWA-Alfian",
+      "name": "srv-web-01",
       "ip": "192.168.100.99"
     },
     "rule": {
