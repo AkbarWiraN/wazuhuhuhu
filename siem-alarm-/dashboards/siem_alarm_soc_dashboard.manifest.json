@@ -1,7 +1,7 @@
 {
   "artifact": "siem_alarm_soc_dashboard.ndjson",
-  "artifact_sha256": "6cc317ff145b9b620469a6a80f09ba7966e92fc54b7033d5b8df3d2f44e18279",
-  "bundle_version": "1.0.0",
+  "artifact_sha256": "0437842baf7d291702cce8e4061816eaf299c80562e1aba99950566f3eecc0da",
+  "bundle_version": "1.1.0",
   "compatibility": {
     "opensearch_dashboards": "2.19.5",
     "saved_object_schema": "legacy aggregation-based visualizations",
@@ -22,7 +22,7 @@
     "time_field": "timestamp",
     "title": "siem-alarm-*"
   },
-  "object_count": 26,
+  "object_count": 27,
   "object_ids": [
     {
       "id": "siem-alarm-soc-v1-data-view",
@@ -34,6 +34,10 @@
     },
     {
       "id": "siem-alarm-soc-v1-search-escalations",
+      "type": "search"
+    },
+    {
+      "id": "siem-alarm-soc-v1-search-latest-escalated-alarms",
       "type": "search"
     },
     {
@@ -133,7 +137,7 @@
   "type_counts": {
     "dashboard": 2,
     "index-pattern": 1,
-    "search": 4,
+    "search": 5,
     "visualization": 19
   }
 }

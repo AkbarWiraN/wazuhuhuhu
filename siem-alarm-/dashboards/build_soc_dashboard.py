@@ -22,7 +22,7 @@ OUTPUT_PATH = Path(__file__).resolve().parent / "siem_alarm_soc_dashboard.ndjson
 MANIFEST_PATH = Path(__file__).resolve().parent / "siem_alarm_soc_dashboard.manifest.json"
 EXPORT_REQUEST_PATH = Path(__file__).resolve().parent / "siem_alarm_soc_dashboard.export-request.json"
 
-BUNDLE_VERSION = "1.0.0"
+BUNDLE_VERSION = "1.1.0"
 DATA_VIEW_ID = "siem-alarm-soc-v1-data-view"
 DATA_VIEW_TITLE = "siem-alarm-*"
 TIME_FIELD = "timestamp"
@@ -635,6 +635,19 @@ def build_records(template):
                 [["event.created", "desc"]],
             ),
             build_search(
+                "siem-alarm-soc-v1-search-latest-escalated-alarms",
+                "SIEM Alarm SOC - Latest Escalated Alarm Events",
+                "Newest create-only SOC escalation events. Default columns are event time, rule description, risk level, and agent name.",
+                ESCALATION,
+                [
+                    "event.created",
+                    "rule.description",
+                    "risk.level",
+                    "agent.name",
+                ],
+                [["event.created", "desc"]],
+            ),
+            build_search(
                 "siem-alarm-soc-v1-search-noisy",
                 "SIEM Alarm SOC - Noisy States",
                 "alarm_state buckets ordered by represented raw-alert count.",
@@ -842,15 +855,16 @@ def build_records(template):
         panel(5, "visualization", "siem-alarm-soc-v1-viz-escalation-count", 24, 5, 8, 8),
         panel(6, "visualization", "siem-alarm-soc-v1-viz-raw-finalized", 32, 5, 8, 8),
         panel(7, "visualization", "siem-alarm-soc-v1-viz-affected-agents", 40, 5, 8, 8),
-        panel(8, "visualization", "siem-alarm-soc-v1-viz-state-trend", 0, 13, 32, 16),
-        panel(9, "visualization", "siem-alarm-soc-v1-viz-risk-distribution", 32, 13, 16, 16),
-        panel(10, "visualization", "siem-alarm-soc-v1-viz-raw-trend", 0, 29, 24, 16),
-        panel(11, "visualization", "siem-alarm-soc-v1-viz-escalation-trend", 24, 29, 24, 16),
-        panel(12, "visualization", "siem-alarm-soc-v1-viz-top-agents", 0, 45, 16, 16),
-        panel(13, "visualization", "siem-alarm-soc-v1-viz-top-rules", 16, 45, 32, 16),
-        panel(14, "visualization", "siem-alarm-soc-v1-viz-source-ip-presence", 0, 61, 24, 16),
-        panel(15, "visualization", "siem-alarm-soc-v1-viz-asset-source", 24, 61, 12, 16),
-        panel(16, "visualization", "siem-alarm-soc-v1-viz-escalation-reason", 36, 61, 12, 16),
+        panel(8, "search", "siem-alarm-soc-v1-search-latest-escalated-alarms", 0, 13, 48, 16),
+        panel(9, "visualization", "siem-alarm-soc-v1-viz-state-trend", 0, 29, 32, 16),
+        panel(10, "visualization", "siem-alarm-soc-v1-viz-risk-distribution", 32, 29, 16, 16),
+        panel(11, "visualization", "siem-alarm-soc-v1-viz-raw-trend", 0, 45, 24, 16),
+        panel(12, "visualization", "siem-alarm-soc-v1-viz-escalation-trend", 24, 45, 24, 16),
+        panel(13, "visualization", "siem-alarm-soc-v1-viz-top-agents", 0, 61, 16, 16),
+        panel(14, "visualization", "siem-alarm-soc-v1-viz-top-rules", 16, 61, 32, 16),
+        panel(15, "visualization", "siem-alarm-soc-v1-viz-source-ip-presence", 0, 77, 24, 16),
+        panel(16, "visualization", "siem-alarm-soc-v1-viz-asset-source", 24, 77, 12, 16),
+        panel(17, "visualization", "siem-alarm-soc-v1-viz-escalation-reason", 36, 77, 12, 16),
     ]
     triage_panels = [
         panel(1, "visualization", "siem-alarm-soc-v1-viz-triage-header", 0, 0, 48, 5),

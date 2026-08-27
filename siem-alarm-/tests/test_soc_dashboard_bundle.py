@@ -55,9 +55,9 @@ class SocDashboardBundleTests(unittest.TestCase):
             counts[record["type"]] = counts.get(record["type"], 0) + 1
         self.assertEqual(
             counts,
-            {"index-pattern": 1, "search": 4, "visualization": 19, "dashboard": 2},
+            {"index-pattern": 1, "search": 5, "visualization": 19, "dashboard": 2},
         )
-        self.assertEqual(len(self.records), 26)
+        self.assertEqual(len(self.records), 27)
 
     def test_data_view_is_self_contained_and_time_based(self):
         data_view = next(record for record in self.records if record["type"] == "index-pattern")
@@ -104,14 +104,14 @@ class SocDashboardBundleTests(unittest.TestCase):
         lines = [BUILDER.compact(record) for record in self.records]
         lines.append(
             BUILDER.compact(
-                {"exportedCount": 26, "missingRefCount": 0, "missingReferences": []}
+                {"exportedCount": 27, "missingRefCount": 0, "missingReferences": []}
             )
         )
         with tempfile.TemporaryDirectory() as directory:
             export_path = Path(directory) / "backup.ndjson"
             export_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             count, digest = EXPORT_VALIDATOR.validate_export(export_path, manifest_path)
-            self.assertEqual(count, 26)
+            self.assertEqual(count, 27)
             self.assertEqual(len(digest), 64)
 
             export_path.write_text("\n".join(lines[:-2] + lines[-1:]) + "\n", encoding="utf-8")
