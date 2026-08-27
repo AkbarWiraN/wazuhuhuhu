@@ -1170,6 +1170,10 @@ Catatan:
 
 ## 13. Buat Index Pattern di Wazuh Dashboard
 
+Jalur utama adalah mengimpor [`dashboards/siem_alarm_soc_dashboard.ndjson`](dashboards/siem_alarm_soc_dashboard.ndjson) sesuai [`dashboards/README.md`](dashboards/README.md). Bundle menyertakan data view deterministik dengan time field `timestamp`, empat saved search, 19 visualisasi, dan dua dashboard SOC. Sebelum import, cek `opensearch_security.multitenancy.enabled`: jika `true`, pilih custom tenant SOC/header `securitytenant` exact; jika `false` (baseline production Wazuh 4.14.7), gunakan default saved-object store tanpa menu/header tenant. Instalasi pertama wajib overwrite nonaktif dan hasilnya harus 26 object sukses tanpa missing reference.
+
+Checklist berikut adalah fallback manual atau validasi setelah import:
+
 - [ ] Buka Wazuh Dashboard → Dashboard Management → Index Patterns.
 - [ ] Create index pattern: `siem-alarm-*`
 - [ ] Time field: `timestamp`

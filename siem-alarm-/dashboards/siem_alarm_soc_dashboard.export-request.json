@@ -1,0 +1,110 @@
+{
+  "objects": [
+    {
+      "type": "index-pattern",
+      "id": "siem-alarm-soc-v1-data-view"
+    },
+    {
+      "type": "search",
+      "id": "siem-alarm-soc-v1-search-priority"
+    },
+    {
+      "type": "search",
+      "id": "siem-alarm-soc-v1-search-escalations"
+    },
+    {
+      "type": "search",
+      "id": "siem-alarm-soc-v1-search-noisy"
+    },
+    {
+      "type": "search",
+      "id": "siem-alarm-soc-v1-search-multi-ip"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-overview-header"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-triage-header"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-state-count"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-priority-count"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-critical-count"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-escalation-count"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-raw-finalized"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-affected-agents"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-asset-gaps"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-multi-ip-count"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-risk-distribution"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-state-trend"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-raw-trend"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-escalation-trend"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-top-agents"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-top-rules"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-source-ip-presence"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-asset-source"
+    },
+    {
+      "type": "visualization",
+      "id": "siem-alarm-soc-v1-viz-escalation-reason"
+    },
+    {
+      "type": "dashboard",
+      "id": "siem-alarm-soc-v1-dashboard-overview"
+    },
+    {
+      "type": "dashboard",
+      "id": "siem-alarm-soc-v1-dashboard-triage"
+    }
+  ],
+  "includeReferencesDeep": false,
+  "excludeExportDetails": false
+}

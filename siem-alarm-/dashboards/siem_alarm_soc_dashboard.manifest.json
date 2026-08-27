@@ -1,0 +1,139 @@
+{
+  "artifact": "siem_alarm_soc_dashboard.ndjson",
+  "artifact_sha256": "6cc317ff145b9b620469a6a80f09ba7966e92fc54b7033d5b8df3d2f44e18279",
+  "bundle_version": "1.0.0",
+  "compatibility": {
+    "opensearch_dashboards": "2.19.5",
+    "saved_object_schema": "legacy aggregation-based visualizations",
+    "wazuh_dashboard": "4.14.7"
+  },
+  "dashboards": [
+    {
+      "id": "siem-alarm-soc-v1-dashboard-overview",
+      "title": "SIEM Alarm SOC - Overview"
+    },
+    {
+      "id": "siem-alarm-soc-v1-dashboard-triage",
+      "title": "SIEM Alarm SOC - Triage & Investigation"
+    }
+  ],
+  "data_view": {
+    "id": "siem-alarm-soc-v1-data-view",
+    "time_field": "timestamp",
+    "title": "siem-alarm-*"
+  },
+  "object_count": 26,
+  "object_ids": [
+    {
+      "id": "siem-alarm-soc-v1-data-view",
+      "type": "index-pattern"
+    },
+    {
+      "id": "siem-alarm-soc-v1-search-priority",
+      "type": "search"
+    },
+    {
+      "id": "siem-alarm-soc-v1-search-escalations",
+      "type": "search"
+    },
+    {
+      "id": "siem-alarm-soc-v1-search-noisy",
+      "type": "search"
+    },
+    {
+      "id": "siem-alarm-soc-v1-search-multi-ip",
+      "type": "search"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-overview-header",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-triage-header",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-state-count",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-priority-count",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-critical-count",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-escalation-count",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-raw-finalized",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-affected-agents",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-asset-gaps",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-multi-ip-count",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-risk-distribution",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-state-trend",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-raw-trend",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-escalation-trend",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-top-agents",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-top-rules",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-source-ip-presence",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-asset-source",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-viz-escalation-reason",
+      "type": "visualization"
+    },
+    {
+      "id": "siem-alarm-soc-v1-dashboard-overview",
+      "type": "dashboard"
+    },
+    {
+      "id": "siem-alarm-soc-v1-dashboard-triage",
+      "type": "dashboard"
+    }
+  ],
+  "target_tenant": "operator-selected custom SOC tenant",
+  "type_counts": {
+    "dashboard": 2,
+    "index-pattern": 1,
+    "search": 4,
+    "visualization": 19
+  }
+}
